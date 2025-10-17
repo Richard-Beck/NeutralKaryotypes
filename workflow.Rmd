@@ -1,0 +1,647 @@
+---
+title: "testing"
+output: html_document
+date: "2025-08-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/projects/014c_hunger2/karyotype_analysis/")
+```
+
+karyotypes object contains the CLONEID passaging table (passaging), karyotype vectors (kvecs), and the rows of the CLONEID perspective table (res) corresponding to kvecs. res and passaging are metadata.
+```{r}
+x <- readRDS("karyotypes.Rds")
+names(x)
+pass <- x$passaging
+pass <- pass[,c("replicate_id","passaged_from_id1")]
+origins <- unique(x$res$origin)
+```
+THe following blocks extract independent lineages (lineages are different cell lines, they are unrelated in the CLONEID db):
+```{r,eval=TRUE}
+# deps: igraph
+is_connected_igraph <- function(df, id1, id2){
+  E <- df[!is.na(df$passaged_from_id1), c("replicate_id", "passaged_from_id1")]
+  g <- igraph::graph_from_data_frame(E, directed = FALSE)
+  if (!(id1 %in% igraph::V(g)$name) || !(id2 %in% igraph::V(g)$name)) return(NA_integer_)
+  d <- igraph::distances(g, v = id1, to = id2)[1,1]
+  if (is.infinite(d)) NA_integer_ else as.integer(d)
+}
+```
+
+
+```{r,eval=FALSE}
+origins <- unique(x$res$origin)
+
+res <- pbapply::pbsapply(origins,function(oi) {
+  sapply(origins,function(oj){
+    is_connected_igraph(pass,oi,oj)
+  })
+})
+
+x$passage_distance <- res
+saveRDS(x,"karyotypes_mod.Rds")
+```
+
+For each lineage find the MRCA 
+
+```{r}
+library(igraph)
+
+build_lineage_graphs <- function(df){
+  E <- df[!is.na(df$passaged_from_id1),
+          c("passaged_from_id1","replicate_id")]
+  names(E) <- c("from","to")                      # parent -> child
+  ids <- unique(c(df$replicate_id, df$passaged_from_id1))
+  ids <- ids[!is.na(ids)]
+  g_dir   <- graph_from_data_frame(E, directed = TRUE, vertices = data.frame(name = ids))
+  g_undir <- as.undirected(g_dir, mode = "collapse")
+  list(g_dir = g_dir, g_undir = g_undir, memb = components(g_undir)$membership)
+}
+
+# Return a single MRCA id (most recent) for a set of origins in this graph
+mrca_of_origins <- function(gl, origin_ids){
+  origin_ids <- intersect(origin_ids, V(gl$g_dir)$name)
+  if (length(origin_ids) == 0L) return(NA_character_)
+  if (length(origin_ids) == 1L) return(origin_ids)
+
+  # 1) Ancestor sets via incoming edges (parents)
+  anc_sets <- lapply(origin_ids, function(o)
+    names(subcomponent(gl$g_dir, o, mode = "in")))
+  common_anc <- Reduce(intersect, anc_sets)
+  if (!length(common_anc)) return(NA_character_)
+
+  # 2) Keep only "lowest" common ancestors: those with no descendant also in the set
+  has_desc_in_set <- vapply(common_anc, function(u){
+    desc_u <- names(subcomponent(gl$g_dir, u, mode = "out"))
+    any(setdiff(desc_u, u) %in% common_anc)
+  }, logical(1))
+  candidates <- common_anc[!has_desc_in_set]
+  if (!length(candidates)) return(NA_character_)
+
+  # 3) If multiple, choose the one closest to all origins (most recent):
+  #    minimize the maximum directed distance (u -> origin)
+  D <- distances(gl$g_dir, v = candidates, to = origin_ids, mode = "out")
+  # some pairs might be unreachable in dirty data; treat Inf as very large
+  D[!is.finite(D)] <- .Machine$integer.max
+  idx <- which.min(apply(D, 1, max))
+  candidates[idx]
+}
+
+mrca_per_component <- function(df, origins){
+  gl <- build_lineage_graphs(df)
+  memb <- gl$memb
+  vnames <- V(gl$g_undir)$name
+  comp_nodes <- split(vnames, memb)
+
+  # map origins to components
+  origin_comp <- memb[match(origins, names(memb))]
+  comp_to_origins <- split(origins[!is.na(origin_comp)], origin_comp[!is.na(origin_comp)])
+
+  res <- lapply(names(comp_nodes), function(cid){
+    oset <- comp_to_origins[[cid]]
+    m <- if (is.null(oset) || !length(oset)) NA_character_ else mrca_of_origins(gl, oset)
+    data.frame(component = as.integer(cid), mrca = m, stringsAsFactors = FALSE)
+  })
+  out <- do.call(rbind, res)
+  out$origins_in_component <- I(lapply(names(comp_nodes), function(cid) comp_to_origins[[cid]] %||% character()))
+  out
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+
+tab <- mrca_per_component(pass, origins)
+tab <- tab[!is.na(tab$mrca),]
+
+```
+
+```{r}
+tab
+
+id <- tab$origins_in_component[[1]][2]
+target <- tab$mrca[1]
+res <- list()
+while(!id==target){
+  tmp <- x$passaging[!is.na(x$passaging$replicate_id) & x$passaging$replicate_id==id,c("replicate_id","passaged_from_id1","passage")]
+  res <- c(res,list(tmp))
+  id <- tmp$passaged_from_id1
+  print(id)
+}
+
+```
+
+The following chunk seems to depend on the verison of igraph? But it's not critical to the analysis pipeline,.
+```{r}
+ti <- tab$origins_in_component[[3]]
+
+ipass <- pass[pass$replicate_id%in%ti,]
+
+dpass <- pbapply::pbsapply(ti,function(oi) {
+  sapply(ti,function(oj){
+    is_connected_igraph(pass,oi,oj)
+  })
+})
+
+karymeans <- do.call(rbind,lapply(ti,function(o){
+  colMeans(do.call(rbind,x$kvecs[x$res$origin==o]))
+}))
+dkary <- as.matrix(dist(karymeans,method="manh"))
+
+ids <- as.character(sapply(ti,function(o) unlist(strsplit(o,split="_"))[2]))
+ids <- gsub("\\d+", "", ids)
+id1 <- do.call(rbind,lapply(1:length(ids),function(id) ids))
+id2 <- do.call(cbind,lapply(1:length(ids),function(id) ids))
+
+
+
+df <- data.frame(kary_dist=dkary[upper.tri(dkary)],
+           passage_dist=dpass[upper.tri(dpass)]/2,
+           id1=id1[upper.tri(id1)],
+           id2=id2[upper.tri(id2)])
+
+df$id <- ""
+df$id[df$id1=="C" | df$id2=="C"] <- "control-?"
+df$id[df$id1=="C" & df$id2=="C"] <- "control-control"
+
+library(ggplot2)
+p <- ggplot(df,aes(x=kary_dist,y=passage_dist,color=id))+
+  geom_point()+
+  scale_color_manual("",values=c("black","red","blue"))+
+  scale_x_continuous("karyotype centroid L1 dist.")+
+  scale_y_continuous("passage distance")+
+  ggtitle("SNU-668")
+p
+
+```
+
+```{r}
+# deps: igraph, ggplot2, grid (for unit)
+library(igraph); library(ggplot2); library(grid); library(ggrepel)
+
+# Build undirected lineage graph once (parent <-> child)
+build_undirected_lineage <- function(pass){
+  edges <- pass[!is.na(pass$passaged_from_id1), c("replicate_id","passaged_from_id1")]
+  colnames(edges) <- c("to","from")
+  ids <- unique(c(pass$replicate_id, pass$passaged_from_id1))
+  graph_from_data_frame(edges, directed = FALSE, vertices = data.frame(name = ids))
+}
+
+# One component → ggplot (MST of shortest-path distances among {root} ∪ origins)
+plot_component_mst <- function(gU, root_id, origins, point_size = 2.8, text_size = 3){
+  nodes <- unique(c(root_id, origins))
+  nodes <- intersect(nodes, V(gU)$name)           # keep only present
+  if (length(nodes) == 0L) return(NULL)
+
+  # pairwise shortest-path (unweighted hop) distances within the undirected graph
+  D <- distances(gU, v = nodes, to = nodes)
+  if (any(!is.finite(D))) {
+    # safety: restrict to the largest connected set among these nodes
+    sg <- induced_subgraph(gU, vids = nodes)
+    comps <- components(sg)$membership
+    keep_comp <- names(which.max(table(comps)))
+    nodes <- V(sg)$name[comps == as.integer(keep_comp)]
+    D <- distances(gU, v = nodes, to = nodes)
+  }
+
+  # build complete weighted graph over nodes, then take MST
+  ut <- which(upper.tri(D), arr.ind = TRUE)
+  Edf <- data.frame(from = nodes[ut[,1]], to = nodes[ut[,2]], weight = as.numeric(D[ut]), 
+                    stringsAsFactors = FALSE)
+  g_full <- graph_from_data_frame(Edf, directed = FALSE, vertices = nodes)
+  g_t    <- mst(g_full, weights = E(g_full)$weight)  # tree with n-1 edges
+
+  # layout: root the tree at the MRCA; fallback to KK if anything odd
+  lay <- if (vcount(g_t) <= 1) matrix(c(0,0), ncol = 2) else
+         tryCatch(layout_as_tree(g_t, root = root_id),
+                  error = function(e) layout_with_kk(g_t))
+
+  nd <- data.frame(name = V(g_t)$name, x = lay[,1], y = lay[,2])
+  nd$is_root   <- nd$name == root_id
+  nd$is_origin <- nd$name %in% origins
+
+  ed <- as_data_frame(g_t, what = "edges")
+  if (nrow(ed)) {
+    ed <- merge(ed, nd[,c("name","x","y")], by.x="from", by.y="name")
+    names(ed)[names(ed) %in% c("x","y")] <- c("x1","y1")
+    ed <- merge(ed, nd[,c("name","x","y")], by.x="to", by.y="name")
+    names(ed)[names(ed) %in% c("x","y")] <- c("x2","y2")
+  } else {
+    ed <- data.frame(x1=numeric(),y1=numeric(),x2=numeric(),y2=numeric())
+  }
+
+  ggplot() +
+    geom_segment(data = ed, aes(x = x1, y = y1, xend = x2, yend = y2), linewidth = 0.35) +
+    geom_point(data = nd, aes(x = x, y = y, shape = is_origin, fill = is_root), size = point_size, color = "black") +
+    scale_shape_manual(values = c(`FALSE` = 21, `TRUE` = 22), guide = "none") +  # origins as squares
+    scale_fill_manual(values = c(`FALSE` = NA, `TRUE` = "grey50"), guide = "none") +  # root filled
+    geom_label(data = nd, aes(x = x, y = y, label = name), size = text_size, vjust = -0.7) +
+    theme_void() +
+    theme(plot.margin = unit(c(20,20,20,20), "pt")) +
+    coord_cartesian(clip = "off") +
+    ggtitle(paste0("Root (MRCA): ", root_id))
+}
+
+# Wrapper: make a list of ggplots for all components from your tab
+# tab must have columns: mrca (character), origins_in_component (list-col of character)
+make_component_plots <- function(pass, tab){
+  tab <- tab[!is.na(tab$mrca), , drop = FALSE]
+  gU <- build_undirected_lineage(pass)
+  # ensure list-col is actually list
+  if (!is.list(tab$origins_in_component)) {
+    stop("tab$origins_in_component must be a list-column of character vectors.")
+  }
+  setNames(
+    lapply(seq_len(nrow(tab)), function(i){
+      plot_component_mst(gU, root_id = tab$mrca[i], origins = tab$origins_in_component[[i]])
+    }),
+    nm = tab$mrca
+  )
+}
+
+
+tab <- mrca_per_component(pass, origins)
+tab <- tab[!is.na(tab$mrca), ]
+
+plots <- make_component_plots(pass, tab)
+
+# Example: show a specific component (by MRCA id)
+plots[[ tab$mrca[1] ]]
+
+# or save all
+# lapply(names(plots), function(k) ggsave(paste0("component_", k, ".png"), plots[[k]], width=8, height=6, dpi=150))
+
+for(pl in names(plots)){
+  fname <- paste0("trees/",pl,".png")
+  ggsave(fname,plot=plots[[pl]],width=14,height=14,units="in",bg = "white")
+}
+
+```
+
+
+
+
+```{r}
+ids <- grepl("SNU-668_C_",x$res$origin) | grepl("SNU-668_G",x$res$origin)
+kvecs <- x$kvecs[ids]
+meta <- x$res[ids,]
+k <- do.call(rbind,kvecs)
+
+k <- lapply(unique(meta$origin),function(id) k[meta$origin==id,])
+names(k) <- unique(meta$origin)
+```
+
+```{r}
+library(parallel)
+cl <- makeCluster(getOption("cl.cores", 8))
+states <- 0:8
+
+K0 <- k$`SNU-668_C_A4_seed`
+KT <- k$`SNU-668_C_A24_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+pmis <- 10^(seq(-8, -1, length.out=19))
+df <- expand.grid(pmis=pmis,rep=1:3)
+
+Ndoublings <- 20*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+source("R/estimate_pmis.R")
+parallel::clusterEvalQ(cl, source("R/estimate_pmis.R"))
+clusterExport(cl, c("K0", "HT", "df"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = 693,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+saveRDS(resdf,"data/SNU-668_control.Rds")
+```
+
+
+Repeat the process with the glucose lines:
+
+```{r}
+
+pmis <- 10^(seq(-8, -1, length.out=19))
+df <- expand.grid(pmis=pmis,rep=1:3)
+Ndoublings <- 6*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+K0 <- k$`SNU-668_G1_A4_seed`
+KT <- k$`SNU-668_G1_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "HT", "df","n_steps"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+saveRDS(resdf,"data/SNU-668_G1.Rds")
+
+K0 <- k$`SNU-668_G2_A4_seed`
+KT <- k$`SNU-668_G2_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "HT", "df","n_steps"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+saveRDS(resdf,"data/SNU-668_G2.Rds")
+
+```
+
+```{r}
+ff <- list.files("data/logL/",full.names = T)
+df <- do.call(rbind,lapply(ff,function(fi){
+  id=unlist(strsplit(basename(fi),split="_"))[2]
+  id <- gsub(".Rds","",id)
+  dfi <- readRDS(fi)
+  dfi$id <- id
+  dfi
+}))
+
+p <- ggplot(df,aes(x=pmis,y=-negll))+
+  facet_wrap(~id)+
+  geom_point()+
+  scale_x_log10()+
+  ggtitle("log likelihood v.s. missegregation rate per lineage")
+p
+
+dag1 <- aggregate(list(negll=df$negll),by=list(pmis=df$pmis,id=df$id),median)
+dag2 <- do.call(rbind,lapply(split(dag1,f=dag1$id),function(i){
+  i[i$negll==min(i$negll),]
+}))
+
+p <- ggplot(dag1,aes(x=pmis,y=-negll))+
+  facet_wrap(~id)+
+  geom_point()+
+  geom_point(data=dag2,color="red")+
+  scale_x_log10("mis-seg prob.")+
+  scale_y_continuous("log likelihood")+
+  ggtitle("log likelihood v.s. missegregation rate per lineage")
+p
+
+
+
+```
+
+```{r}
+
+cl <- makeCluster(getOption("cl.cores", 14))
+states <- 0:8
+
+K0 <- k$`SNU-668_C_A4_seed`
+KT <- k$`SNU-668_C_A24_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+pmis <- dag2$pmis[dag2$id=="control"]
+Nreps <- 150
+
+Ndoublings <- 20*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+source("R/estimate_pmis.R")
+parallel::clusterEvalQ(cl, source("R/estimate_pmis.R"))
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsC <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="control"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsC,"data/testRuns/pops_C.Rds")
+
+Ndoublings <- 6*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+K0 <- k$`SNU-668_G1_A4_seed`
+KT <- k$`SNU-668_G1_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsG1 <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="G1"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsG1,"data/testRuns/pops_G1.Rds")
+
+K0 <- k$`SNU-668_G2_A4_seed`
+KT <- k$`SNU-668_G2_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsG2 <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="G2"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsG2,"data/testRuns/pops_G2.Rds")
+stopCluster(cl)
+```
+
+```{r}
+
+test_null <- function(pop,KT){
+  
+  library(transport)
+  sampleToInt <- function(pp,Nsam=20){
+    samstr <- sample(names(pp),size = Nsam,prob = pp)
+    samstr <- table(samstr)
+    list(coords=matrix(as.numeric(unlist(strsplit(names(samstr),split="[.]"))),ncol=22,byrow = TRUE),
+         counts=samstr)
+  }
+  
+  Nsam=nrow(KT)
+  
+  samstr <- table(apply(KT,1,paste,collapse="."))
+  smm <- list(coords=matrix(as.numeric(unlist(strsplit(names(samstr),split="[.]"))),ncol=22,byrow = TRUE),
+              counts=samstr)
+  wtst <- wpp(smm$coords,mass=smm$counts)
+  dnull <- sapply(1:length(pop),function(i){
+    sapply(1:length(pop),function(j){
+      if(i>=j) return(NaN)
+      popi <- sampleToInt(pop[[i]],Nsam)
+      popj <- sampleToInt(pop[[j]],Nsam)
+      
+      wi <- wpp(popi$coords,mass=popi$counts)
+      wj <- wpp(popj$coords,mass=popj$counts)
+      wasserstein(wi,wj)  
+    })
+  })
+  dnull <- dnull[is.finite(dnull)]
+  
+  dtst <- sapply(1:length(pop),function(j){
+    popi <- sampleToInt(pop[[i]],Nsam)
+    
+    wi <- wpp(popi$coords,mass=popi$counts)
+    wasserstein(wi,wtst)  
+  })
+  
+  tst_stat <- median(dtst)
+  empp <- mean(dnull>tst_stat)
+  list(dnull=dnull,dtst=dtst,empp=empp)
+}
+
+pop <- readRDS("data/testRuns/pops_C.Rds")
+KT <- round(k$`SNU-668_C_A24_seed`)
+res_C <- test_null(pop,KT)
+
+pop <- readRDS("data/testRuns/pops_G1.Rds")
+KT <- round(k$`SNU-668_G1_A10_seed`)
+res_G1 <- test_null(pop,KT)
+
+pop <- readRDS("data/testRuns/pops_G2.Rds")
+KT <- round(k$`SNU-668_G2_A10_seed`)
+res_G2 <- test_null(pop,KT)
+
+
+res <-list(res_C=res_C,res_G1=res_G1,res_G2=res_G2)
+saveRDS(res,"data/testResults.Rds")
+```
+
+
+```{r}
+res <- readRDS("data/testResults.Rds")
+sapply(res,function(ri) ri$empp)
+dfnull <- rbind(data.frame(dw=res$res_C$dnull,id="control"),
+      data.frame(dw=res$res_G1$dnull,id="G1"),
+      data.frame(dw=res$res_G2$dnull,id="G2"))
+
+dftst <- rbind(data.frame(dw=res$res_C$dtst,id="control"),
+      data.frame(dw=res$res_G1$dtst,id="G1"),
+      data.frame(dw=res$res_G2$dtst,id="G2"))
+tmp <- sapply(res,function(ri) ri$empp)
+
+dftst2 <- aggregate(list(dw=dftst$dw),by=list(id=dftst$id),median)
+
+
+p <- ggplot(dfnull, aes(x=dw)) +
+  facet_grid(rows=vars(id)) +
+  geom_histogram(aes(y=after_stat(density)), binwidth=0.1, alpha=0.5) +
+  geom_histogram(data=dftst, aes(y=after_stat(density)), 
+                 binwidth=0.1, fill="red", alpha=0.5)+
+  geom_vline(data=dftst2,aes(xintercept=dw),color="red",linetype=2)+
+  scale_x_continuous("wasserstein distance")+
+  scale_y_continuous("empirical distribution")
+p
+
+fisher_p <- function(p) {
+  k <- length(p)
+  stat <- -2 * sum(log(p))
+  pchisq(stat, df = 2 * k, lower.tail = FALSE)
+}
+
+# Example: starved lineages G1 and G2
+# Use a conservative bound for "p < 1e-4"
+p_starved <- c(1e-4, 0.036)
+fisher_p(p_starved)
+```
+```{r}
+
+ff <- list.files("data/testRuns/",full.names = T)
+
+df <- do.call(rbind,lapply(ff,function(fi){
+  pop <- readRDS(fi)
+  apop <- tapply(unlist(pop), names(unlist(pop)), sum)
+  hpop <- hist_mat_from_named_counts(apop)
+  hpop <- apply(hpop,2,function(i) i/sum(i))
+  dfi <- reshape2::melt(hpop)
+  id <- unlist(strsplit(basename(fi),split="_"))[2]
+  id <- gsub(".Rds","",id)
+  dfi$id <- id
+  dfi
+}))
+
+saveRDS(df,"data/test_pop_smms.Rds")
+
+
+```
+
+```{r}
+
+
+proc_sample <- function(kname){
+  h <- hist_mat_from_matrix(k[[kname]])  
+  h <- apply(h,2,function(i) i/sum(i))
+  rownames(h) <- (1:nrow(h))-1
+  colnames(h) <- paste0("chr",1:ncol(h))
+  dfi <- reshape2::melt(h)
+  colnames(dfi)[1:2] <- c("states","chr")
+  id <- unlist(strsplit(kname,"_"))
+  dfi$id <- id[2]
+  dfi$passage <- id[3]
+  dfi
+} 
+x <- readRDS("karyotypes_mod.Rds")
+ids <- grepl("SNU-668_C_",x$res$origin) | grepl("SNU-668_G",x$res$origin)
+kvecs <- x$kvecs[ids]
+meta <- x$res[ids,]
+k <- do.call(rbind,kvecs)
+
+k <- lapply(unique(meta$origin),function(id) k[meta$origin==id,])
+names(k) <- unique(meta$origin)
+
+dfsam <- do.call(rbind,lapply(names(k),proc_sample))
+dfsim <- readRDS("data/test_pop_smms.Rds")
+dfsim$passage <- "sim"
+df <- rbind(dfsam,dfsim)
+
+lut <- c("A4"="early","A10"="late","A24"="late","sim"="sim")
+
+p1 <- ggplot(df,aes(x=states,y=value,color=lut[passage]))+
+  geom_line(alpha=0.5)+
+  facet_grid(cols=vars(chr),rows=vars(id))+
+  scale_color_discrete("sample timepoint")+
+  scale_x_continuous("copy number")+
+  scale_y_continuous("relative frequency")
+p1
+
+p <- ggplot(df[df$passage=="A4",],aes(x=states,y=value,color=id))+
+  geom_line()+
+  facet_wrap(~chr)+
+  scale_color_discrete("lineage")+
+  scale_x_continuous("copy number")+
+  scale_y_continuous("relative frequency")
+p
+
+0.25^(1/4)
+
+```
+```{r}
+x <- readRDS("karyotypes_mod.Rds")
+
+ids <- grepl("SNU-668",x$res$origin) 
+kvecs <- x$kvecs[ids]
+meta <- x$res[ids,]
+k <- do.call(rbind,kvecs)
+
+k <- lapply(unique(meta$origin),function(id) k[meta$origin==id,])
+names(k) <- unique(meta$origin)
+
+df <- do.call(rbind,lapply(names(k),proc_sample))
+
+p <- ggplot(df[df$chr=="chr18",],aes(x=states,y=value,color=passage))+
+  geom_line()+
+  facet_wrap(~id)
+p
+
+p <- ggplot(df[df$chr=="chr21",],aes(x=states,y=value,color=passage))+
+  geom_line()+
+  facet_wrap(~id)
+p
+
+```
+
+
