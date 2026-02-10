@@ -1,0 +1,449 @@
+---
+title: "testing"
+output: html_document
+date: "2025-08-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/projects/021_ltee_models/NeutralKaryotypes/")
+```
+
+
+```{r}
+ids <- readLines("karyotyped_samples.txt")
+
+mrcas <- c("SUM-159_NLS_4N_MRCA_harvest",
+           "MDA-MB-231_MRCA_harvest",
+           "HGC-27_MRCA_harvest",
+           "SUM-159_NLS_2N_MRCA_harvest",
+           "SNU-668_MRCA_harvest")
+```
+
+```{r}
+require(DBI)
+require(RMariaDB)
+source("R/db_utils.R")
+dbvars <- load_db_vars("db_creds.txt")
+db <- dbConnect(
+    MariaDB(),
+    host = dbvars["HOST"],
+    user = dbvars["USER"],
+    password = dbvars["PASSWORD"],
+    dbname = dbvars["DBNAME"]
+)
+
+x <- dbGetQuery(db, "SELECT * FROM Passaging")
+
+
+```
+```{r}
+
+find_all_ancestors <- function(id,g){
+  ids <- c()
+    while(!is.na(id)){
+      ids <- c(id,ids)
+      id <- g$passaged_from_id1[g$id==id]
+    }
+  return(ids)
+}
+
+mrca_an <- lapply(mrcas,find_all_ancestors,g=x)
+id_an <- lapply(ids,find_all_ancestors,g=x)
+
+## which mrca belongs to each id?
+id_map <- lapply(id_an,function(lin1){
+  ix <- which.max(sapply(mrca_an,function(lin2){
+    sum(lin1[1:length(lin2)]==lin2)
+  }))
+  
+  list(id_start=mrcas[ix],id_end=tail(lin1,1))
+  
+})
+
+
+```
+
+```{r}
+karyotypes <- get_karyotyping(c(mrcas,ids))
+```
+
+```{r}
+source("R/estimate_pmis.R")
+
+
+fit_objects <- lapply(id_map,function(id){
+  
+  id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start])
+  if(!id$id_end%in%karyotypes$id){
+    print(id$id_end)
+    return(NULL)
+  }
+  id$KT <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_end])
+  
+  id$H0 <- hist_mat_from_matrix(round(id$K0))
+  id$HT <- hist_mat_from_matrix(round(id$KT))
+  
+  id$delta_pass <- x$passage[x$id==id$id_end]-x$passage[x$id==id$id_start]
+  id
+})
+fit_objects <- fit_objects[!sapply(fit_objects,is.null)]
+saveRDS(fit_objects,"fit_objects.Rds")
+```
+
+
+
+
+```{r}
+library(parallel)
+cl <- makeCluster(getOption("cl.cores", 8))
+states <- 0:8
+
+K0 <- fit_objects[[1]]$K0
+KT <- fit_objects[[1]]$KT
+
+H0 <- fit_objects[[1]]$H0
+HT <- fit_objects[[1]]$HT
+
+pmis <- 10^(seq(-8, -1, length.out=19))
+df <- expand.grid(pmis=pmis,rep=1:3)
+
+Ndoublings <- fit_objects[[1]]$delta_pass*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+source("R/estimate_pmis.R")
+parallel::clusterEvalQ(cl, source("R/estimate_pmis.R"))
+clusterExport(cl, c("K0", "HT", "df"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = 693,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+```
+
+
+Repeat the process with the glucose lines:
+
+```{r}
+
+pmis <- 10^(seq(-8, -1, length.out=19))
+df <- expand.grid(pmis=pmis,rep=1:3)
+Ndoublings <- 6*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+K0 <- k$`SNU-668_G1_A4_seed`
+KT <- k$`SNU-668_G1_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "HT", "df","n_steps"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+saveRDS(resdf,"data/SNU-668_G1.Rds")
+
+K0 <- k$`SNU-668_G2_A4_seed`
+KT <- k$`SNU-668_G2_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "HT", "df","n_steps"))
+res <- parSapplyLB(cl,1:nrow(df),function(i) get_nll(p_mis = df$pmis[i],K0 = K0,H_obs=HT,n_steps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+resdf <- df
+resdf$negll <- res
+saveRDS(resdf,"data/SNU-668_G2.Rds")
+
+```
+
+```{r}
+ff <- list.files("data/logL/",full.names = T)
+df <- do.call(rbind,lapply(ff,function(fi){
+  id=unlist(strsplit(basename(fi),split="_"))[2]
+  id <- gsub(".Rds","",id)
+  dfi <- readRDS(fi)
+  dfi$id <- id
+  dfi
+}))
+
+p <- ggplot(df,aes(x=pmis,y=-negll))+
+  facet_wrap(~id)+
+  geom_point()+
+  scale_x_log10()+
+  ggtitle("log likelihood v.s. missegregation rate per lineage")
+p
+
+dag1 <- aggregate(list(negll=df$negll),by=list(pmis=df$pmis,id=df$id),median)
+dag2 <- do.call(rbind,lapply(split(dag1,f=dag1$id),function(i){
+  i[i$negll==min(i$negll),]
+}))
+
+p <- ggplot(dag1,aes(x=pmis,y=-negll))+
+  facet_wrap(~id)+
+  geom_point()+
+  geom_point(data=dag2,color="red")+
+  scale_x_log10("mis-seg prob.")+
+  scale_y_continuous("log likelihood")+
+  ggtitle("log likelihood v.s. missegregation rate per lineage")
+p
+
+
+
+```
+
+```{r}
+
+cl <- makeCluster(getOption("cl.cores", 14))
+states <- 0:8
+
+K0 <- k$`SNU-668_C_A4_seed`
+KT <- k$`SNU-668_C_A24_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+pmis <- dag2$pmis[dag2$id=="control"]
+Nreps <- 150
+
+Ndoublings <- 20*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+
+source("R/estimate_pmis.R")
+parallel::clusterEvalQ(cl, source("R/estimate_pmis.R"))
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsC <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="control"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsC,"data/testRuns/pops_C.Rds")
+
+Ndoublings <- 6*5
+dt <- log(2)
+
+t <- dt*Ndoublings
+dt <- 0.1
+n_steps <- round(t/dt)
+K0 <- k$`SNU-668_G1_A4_seed`
+KT <- k$`SNU-668_G1_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsG1 <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="G1"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsG1,"data/testRuns/pops_G1.Rds")
+
+K0 <- k$`SNU-668_G2_A4_seed`
+KT <- k$`SNU-668_G2_A10_seed`
+
+H0 <- hist_mat_from_matrix(round(K0))
+HT <- hist_mat_from_matrix(round(KT))
+
+clusterExport(cl, c("K0", "n_steps","dag2"))
+popsG2 <- parLapplyLB(cl,1:Nreps,function(i) get_pop(p_mis = dag2$pmis[dag2$id=="G2"],K0 = K0,nsteps = n_steps,max_pop = 0.3*10^6,cull_keep = 1/(2^5),seed = i))
+saveRDS(popsG2,"data/testRuns/pops_G2.Rds")
+stopCluster(cl)
+```
+
+```{r}
+
+test_null <- function(pop,KT){
+  
+  library(transport)
+  sampleToInt <- function(pp,Nsam=20){
+    samstr <- sample(names(pp),size = Nsam,prob = pp)
+    samstr <- table(samstr)
+    list(coords=matrix(as.numeric(unlist(strsplit(names(samstr),split="[.]"))),ncol=22,byrow = TRUE),
+         counts=samstr)
+  }
+  
+  Nsam=nrow(KT)
+  
+  samstr <- table(apply(KT,1,paste,collapse="."))
+  smm <- list(coords=matrix(as.numeric(unlist(strsplit(names(samstr),split="[.]"))),ncol=22,byrow = TRUE),
+              counts=samstr)
+  wtst <- wpp(smm$coords,mass=smm$counts)
+  dnull <- sapply(1:length(pop),function(i){
+    sapply(1:length(pop),function(j){
+      if(i>=j) return(NaN)
+      popi <- sampleToInt(pop[[i]],Nsam)
+      popj <- sampleToInt(pop[[j]],Nsam)
+      
+      wi <- wpp(popi$coords,mass=popi$counts)
+      wj <- wpp(popj$coords,mass=popj$counts)
+      wasserstein(wi,wj)  
+    })
+  })
+  dnull <- dnull[is.finite(dnull)]
+  
+  dtst <- sapply(1:length(pop),function(j){
+    popi <- sampleToInt(pop[[i]],Nsam)
+    
+    wi <- wpp(popi$coords,mass=popi$counts)
+    wasserstein(wi,wtst)  
+  })
+  
+  tst_stat <- median(dtst)
+  empp <- mean(dnull>tst_stat)
+  list(dnull=dnull,dtst=dtst,empp=empp)
+}
+
+pop <- readRDS("data/testRuns/pops_C.Rds")
+KT <- round(k$`SNU-668_C_A24_seed`)
+res_C <- test_null(pop,KT)
+
+pop <- readRDS("data/testRuns/pops_G1.Rds")
+KT <- round(k$`SNU-668_G1_A10_seed`)
+res_G1 <- test_null(pop,KT)
+
+pop <- readRDS("data/testRuns/pops_G2.Rds")
+KT <- round(k$`SNU-668_G2_A10_seed`)
+res_G2 <- test_null(pop,KT)
+
+
+res <-list(res_C=res_C,res_G1=res_G1,res_G2=res_G2)
+saveRDS(res,"data/testResults.Rds")
+```
+
+
+```{r}
+res <- readRDS("data/testResults.Rds")
+sapply(res,function(ri) ri$empp)
+dfnull <- rbind(data.frame(dw=res$res_C$dnull,id="control"),
+      data.frame(dw=res$res_G1$dnull,id="G1"),
+      data.frame(dw=res$res_G2$dnull,id="G2"))
+
+dftst <- rbind(data.frame(dw=res$res_C$dtst,id="control"),
+      data.frame(dw=res$res_G1$dtst,id="G1"),
+      data.frame(dw=res$res_G2$dtst,id="G2"))
+tmp <- sapply(res,function(ri) ri$empp)
+
+dftst2 <- aggregate(list(dw=dftst$dw),by=list(id=dftst$id),median)
+
+
+p <- ggplot(dfnull, aes(x=dw)) +
+  facet_grid(rows=vars(id)) +
+  geom_histogram(aes(y=after_stat(density)), binwidth=0.1, alpha=0.5) +
+  geom_histogram(data=dftst, aes(y=after_stat(density)), 
+                 binwidth=0.1, fill="red", alpha=0.5)+
+  geom_vline(data=dftst2,aes(xintercept=dw),color="red",linetype=2)+
+  scale_x_continuous("wasserstein distance")+
+  scale_y_continuous("empirical distribution")
+p
+
+fisher_p <- function(p) {
+  k <- length(p)
+  stat <- -2 * sum(log(p))
+  pchisq(stat, df = 2 * k, lower.tail = FALSE)
+}
+
+# Example: starved lineages G1 and G2
+# Use a conservative bound for "p < 1e-4"
+p_starved <- c(1e-4, 0.036)
+fisher_p(p_starved)
+```
+```{r}
+
+ff <- list.files("data/testRuns/",full.names = T)
+
+df <- do.call(rbind,lapply(ff,function(fi){
+  pop <- readRDS(fi)
+  apop <- tapply(unlist(pop), names(unlist(pop)), sum)
+  hpop <- hist_mat_from_named_counts(apop)
+  hpop <- apply(hpop,2,function(i) i/sum(i))
+  dfi <- reshape2::melt(hpop)
+  id <- unlist(strsplit(basename(fi),split="_"))[2]
+  id <- gsub(".Rds","",id)
+  dfi$id <- id
+  dfi
+}))
+
+saveRDS(df,"data/test_pop_smms.Rds")
+
+
+```
+
+```{r}
+
+
+proc_sample <- function(kname){
+  h <- hist_mat_from_matrix(k[[kname]])  
+  h <- apply(h,2,function(i) i/sum(i))
+  rownames(h) <- (1:nrow(h))-1
+  colnames(h) <- paste0("chr",1:ncol(h))
+  dfi <- reshape2::melt(h)
+  colnames(dfi)[1:2] <- c("states","chr")
+  id <- unlist(strsplit(kname,"_"))
+  dfi$id <- id[2]
+  dfi$passage <- id[3]
+  dfi
+} 
+x <- readRDS("karyotypes_mod.Rds")
+ids <- grepl("SNU-668_C_",x$res$origin) | grepl("SNU-668_G",x$res$origin)
+kvecs <- x$kvecs[ids]
+meta <- x$res[ids,]
+k <- do.call(rbind,kvecs)
+
+k <- lapply(unique(meta$origin),function(id) k[meta$origin==id,])
+names(k) <- unique(meta$origin)
+
+dfsam <- do.call(rbind,lapply(names(k),proc_sample))
+dfsim <- readRDS("data/test_pop_smms.Rds")
+dfsim$passage <- "sim"
+df <- rbind(dfsam,dfsim)
+
+lut <- c("A4"="early","A10"="late","A24"="late","sim"="sim")
+
+p1 <- ggplot(df,aes(x=states,y=value,color=lut[passage]))+
+  geom_line(alpha=0.5)+
+  facet_grid(cols=vars(chr),rows=vars(id))+
+  scale_color_discrete("sample timepoint")+
+  scale_x_continuous("copy number")+
+  scale_y_continuous("relative frequency")
+p1
+
+p <- ggplot(df[df$passage=="A4",],aes(x=states,y=value,color=id))+
+  geom_line()+
+  facet_wrap(~chr)+
+  scale_color_discrete("lineage")+
+  scale_x_continuous("copy number")+
+  scale_y_continuous("relative frequency")
+p
+
+0.25^(1/4)
+
+```
+```{r}
+x <- readRDS("karyotypes_mod.Rds")
+
+ids <- grepl("SNU-668",x$res$origin) 
+kvecs <- x$kvecs[ids]
+meta <- x$res[ids,]
+k <- do.call(rbind,kvecs)
+
+k <- lapply(unique(meta$origin),function(id) k[meta$origin==id,])
+names(k) <- unique(meta$origin)
+
+df <- do.call(rbind,lapply(names(k),proc_sample))
+
+p <- ggplot(df[df$chr=="chr18",],aes(x=states,y=value,color=passage))+
+  geom_line()+
+  facet_wrap(~id)
+p
+
+p <- ggplot(df[df$chr=="chr21",],aes(x=states,y=value,color=passage))+
+  geom_line()+
+  facet_wrap(~id)
+p
+
+```
+
+
