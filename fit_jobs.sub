@@ -1,0 +1,35 @@
+#! /bin/bash
+#SBATCH --job-name=lineage_analysis
+#SBATCH --output=logs/lineage_%A_%a.out
+#SBATCH --error=logs/lineage_%A_%a.err
+
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+#SBATCH --qos=small
+#SBATCH --array=1-49
+
+# Container Configuration (Matches provided template)
+CONTAINER_URI="docker://dockerhub.moffitt.org/hpc/rocker-rstudio:4.4.2"
+BINDS="-B /home/$USER,/share"
+
+# Keep OMP single threaded so R can fork safely via parallel::makeCluster
+export OMP_NUM_THREADS=1
+export TZ="US/Eastern"
+
+# Ensure output directory exists (optional safety check)
+mkdir -p logs
+
+echo "Starting task $SLURM_ARRAY_TASK_ID on $(hostname)"
+echo "Allocated $SLURM_CPUS_PER_TASK cores"
+
+# Execution
+# Arguments for R/analyse_lineage.R:
+# 1: Index (SLURM_ARRAY_TASK_ID)
+# 2: Number of Cores (SLURM_CPUS_PER_TASK)
+
+apptainer exec $BINDS $CONTAINER_URI \
+  Rscript R/analyse_lineage.R \
+  "$SLURM_ARRAY_TASK_ID" \
+  "$SLURM_CPUS_PER_TASK"
