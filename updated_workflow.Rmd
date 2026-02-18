@@ -5,22 +5,28 @@ date: "2025-08-18"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = "~/projects/021_ltee_models/NeutralKaryotypes/")
+knitr::opts_knit$set(root.dir = "/Users/4470246/Repositories/NeutralKaryotypes")
 ```
 
 
 ```{r}
 ids <- readLines("karyotyped_samples.txt")
+ids=grep("HGC",ids,value=T, invert = T)
+ids=grep("_r",ids,value=T, invert = T)
+ids=grep("_K",ids,value=T, invert = T)
 
-mrcas <- c("SUM-159_NLS_4N_MRCA_harvest",
-           "MDA-MB-231_MRCA_harvest",
-           "HGC-27_MRCA_harvest",
+mrcas <- c("MDA-MB-231_RPMI_A12_VT2_seed", 
+           "SNU-668_C_A4_seed",
+           "SNU-668_RevC_A3_seed",
            "SUM-159_NLS_2N_MRCA_harvest",
-           "SNU-668_MRCA_harvest")
+           "SUM-159_NLS_4N_MRCA_harvest")
+
+ids = setdiff(ids,mrcas)
 ```
 
 ```{r}
 require(DBI)
+require(RMariaDB)
 source("R/db_utils.R")
 dbvars <- load_db_vars("db_creds.txt")
 db <- dbConnect(
@@ -35,6 +41,7 @@ x <- dbGetQuery(db, "SELECT * FROM Passaging")
 m <- dbGetQuery(db,"SELECT * FROM Media")
 
 ```
+
 ```{r}
 
 find_all_ancestors <- function(id,g){
@@ -69,44 +76,146 @@ karyotypes <- get_karyotyping(c(mrcas,ids))
 ```{r}
 source("R/estimate_pmis.R")
 
-
-fit_objects <- lapply(id_map,function(id){
+# --- Helper to merge Replicate Names ---
+get_condition_name <- function(id_string) {
   
-  id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start])
-  if(!id$id_end%in%karyotypes$id){
-    print(id$id_end)
+  # 1. Fix known typos (Handling Point 4)
+  # Fixes the lowercase 'k' in "A18k" so it matches "A18K"
+  id_string <- gsub("A18k", "A18K", id_string)
+  
+  # 2. Strict Replicate Merging
+  # Target: Underscore + (O, Q, G, P, r, or K) + Digits + Underscore
+  # Replacement: Underscore + Letter + Underscore
+  # This EXCLUDES 'A' (Clone IDs) and 'C' (Condition IDs) so numbers aren't stripped from them.
+  gsub("_([OQGPrK])[0-9]+_", "_\\1_", id_string)
+}
+
+# --- Group IDs by Biological Condition ---
+names(id_map) <- sapply(id_map, function(x) x$id_end)
+conditions <- sapply(names(id_map), get_condition_name)
+grouped_map <- split(id_map, conditions)
+
+# --- Create Merged Fit Objects ---
+fit_objects <- lapply(names(grouped_map), function(cond_name) {
+  group <- grouped_map[[cond_name]]
+  
+  # Validation: Ensure all replicates map to the same Ancestor
+  mrcas <- unique(sapply(group, function(x) x$id_start))
+  if(length(mrcas) > 1) {
+    warning(paste("Skipping", cond_name, "- Replicates map to different MRCAs:", paste(mrcas, collapse=", ")))
     return(NULL)
   }
-  id$KT <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_end])
   
-  id$H0 <- hist_mat_from_matrix(round(id$K0))
-  id$HT <- hist_mat_from_matrix(round(id$KT))
+  # Get Ancestor (K0)
+  id_start <- group[[1]]$id_start
+  K0 <- do.call(rbind, karyotypes$karyotype[karyotypes$id == id_start])
+  if(is.null(K0)) return(NULL) # Safety check
   
-  id$delta_pass <- x$passage[x$id==id$id_end]-x$passage[x$id==id$id_start]
-  id
+  # Merge Target Karyotypes (KT)
+  KT_list <- lapply(group, function(x) {
+    if(!x$id_end %in% karyotypes$id) return(NULL)
+    do.call(rbind, karyotypes$karyotype[karyotypes$id == x$id_end])
+  })
+  
+  KT_list <- KT_list[!sapply(KT_list, is.null)]
+  if(length(KT_list) == 0) return(NULL)
+  
+  KT_merged <- do.call(rbind, KT_list)
+  HT_merged <- hist_mat_from_matrix(round(KT_merged))
+  H0 <- hist_mat_from_matrix(round(K0))
+  
+  # Calculate Time (Delta Pass)
+  pass_start <- x$passage[x$id == id_start]
+  pass_ends <- sapply(group, function(item) x$passage[x$id == item$id_end])
+  
+  if (any(is.na(pass_ends))) return(NULL)
+  delta_pass <- mean(pass_ends) - pass_start
+  
+  list(
+    id_start = id_start,
+    id_end = cond_name,       
+    replicates = names(group),
+    K0 = K0,
+    KT = KT_merged,           
+    H0 = H0,
+    HT = HT_merged,
+    delta_pass = delta_pass
+  )
 })
-fit_objects <- fit_objects[!sapply(fit_objects,is.null)]
-saveRDS(fit_objects,"fit_objects.Rds")
+
+# Filter Nulls and Save
+fit_objects <- fit_objects[!sapply(fit_objects, is.null)]
+saveRDS(fit_objects, "fit_objects.Rds")
+
+# 
+# 
+# fit_objects <- lapply(id_map,function(id){
+#   
+#   id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start])
+#   if(!id$id_end%in%karyotypes$id){
+#     print(id$id_end)
+#     return(NULL)
+#   }
+#   id$KT <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_end])
+#   
+#   id$H0 <- hist_mat_from_matrix(round(id$K0))
+#   id$HT <- hist_mat_from_matrix(round(id$KT))
+#   
+#   id$delta_pass <- x$passage[x$id==id$id_end]-x$passage[x$id==id$id_start]
+#   id
+# })
+# fit_objects <- fit_objects[!sapply(fit_objects,is.null)]
+# saveRDS(fit_objects,"fit_objects.Rds")
 ```
 
 ```{r}
-ff <- list.files("data/fits/",full.names = T)
+# --- Execute the Local Simulation Pipeline ---
+# This runs the logic from R/run_local.R, processing all samples in fit_objects.Rds
+# It effectively replaces the Slurm submission step.
 
-df <- do.call(rbind,lapply(ff,function(fi){
+message("Starting local simulation pipeline...")
+source("R/run_local.R")
+message("Simulation pipeline complete.")
+```
+
+```{r}
+# --- Collect Results and Save to CSV ---
+ff <- list.files("data/fits/", full.names = TRUE)
+
+df <- do.call(rbind, lapply(ff, function(fi){
   res <- readRDS(fi)
-  if(!"test_null_res"%in%names(res)) return(NULL)
-  print(res$id_start)
-  data.frame(start=res$id_start,end=res$id_end,p=res$test_null_res$empp,delta_pass=res$delta_pass)
+  
+  # Skip if the run didn't finish the null test
+  if(!"test_null_res" %in% names(res)) return(NULL)
+  
+  # --- Logic to extract the Best Fit CIN Rate ---
+  # Find the row in the results dataframe with the lowest Negative Log Likelihood
+  best_idx <- which.min(res$resdf$negll)
+  best_cin_rate <- res$resdf$pmis[best_idx]
+  
+  data.frame(
+    condition = res$id_end,       # The experimental condition (e.g., O_A3)
+    ancestor = res$id_start,      # The starting clone
+    p_value = res$test_null_res$empp, # Neutrality score
+    cin_rate = best_cin_rate,     # <--- The fitted mis-segregation rate
+    delta_pass = res$delta_pass
+  )
 }))
-df <- df[order(df$p),]
 
-data.table::fwrite(df,"data/neutral_probability.csv",sep=",")
+# Sort by p-value for easier reading
+df <- df[order(df$p_value),]
+
+# Save the enhanced CSV
+data.table::fwrite(df, "data/neutral_probability.csv", sep=",")
+
+# Preview the top results
+print(head(df))
 
 ```
 
 ```{r}
-x <- readRDS("data/fits/SNU-668_C_A4_seed.Rds")
-y <- readRDS("data/pops/SNU-668_C_A4_seed.Rds")
+x <- readRDS("data/fits/MDA-MB-231_G1_A4_seed.Rds")
+y <- readRDS("data/pops/MDA-MB-231_G1_A4_seed.Rds")
 ```
 
 
