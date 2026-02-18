@@ -57,13 +57,46 @@ mrca_an <- lapply(mrcas,find_all_ancestors,g=x)
 id_an <- lapply(ids,find_all_ancestors,g=x)
 
 ## which mrca belongs to each id?
-id_map <- lapply(id_an,function(lin1){
-  ix <- which.max(sapply(mrca_an,function(lin2){
-    sum(lin1[1:length(lin2)]==lin2)
-  }))
+## Map each endpoint to the closest proxy MRCA based on the deepest shared branch point
+id_map <- lapply(id_an, function(lin1) {
   
-  list(id_start=mrcas[ix],id_end=tail(lin1,1))
+  end_id <- tail(lin1, 1)
   
+  # 1. Calculate how many ancestral nodes lin1 shares with each proxy MRCA
+  shared_path_lengths <- sapply(mrca_an, function(lin2) {
+    min_len <- min(length(lin1), length(lin2))
+    matches <- lin1[1:min_len] == lin2[1:min_len]
+    if (all(matches)) {
+      return(min_len)
+    } else {
+      return(which(!matches)[1] - 1)
+    }
+  })
+  
+  # 2. Find all proxy MRCAs that tied for the longest shared path
+  max_len <- max(shared_path_lengths)
+  tied_indices <- which(shared_path_lengths == max_len)
+  
+  # 3. If there is a topological tie, break it by string similarity
+  if (length(tied_indices) > 1) {
+    tied_mrcas <- mrcas[tied_indices]
+    
+    # Calculate Levenshtein string distance using R's built-in adist()
+    # The smallest distance = most biologically similar name 
+    # (e.g., SNU-668_RevG will mathematically pair with SNU-668_RevC)
+    dists <- as.numeric(adist(end_id, tied_mrcas))
+    
+    # Pick the index of the most similar MRCA string
+    best_tie_idx <- which.min(dists)
+    final_ix <- tied_indices[best_tie_idx]
+  } else {
+    final_ix <- tied_indices[1]
+  }
+  
+  list(
+    id_start = mrcas[final_ix], 
+    id_end = end_id
+  )
 })
 
 
