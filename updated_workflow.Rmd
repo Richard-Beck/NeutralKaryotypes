@@ -153,6 +153,9 @@ fit_objects <- lapply(names(grouped_map), function(cond_name) {
   KT_list <- KT_list[!sapply(KT_list, is.null)]
   if(length(KT_list) == 0) return(NULL)
   
+  #Assign the actual replicate names to the list before merging
+  names(KT_list) <- sapply(group, function(x) x$id_end)
+  
   KT_merged <- do.call(rbind, KT_list)
   HT_merged <- hist_mat_from_matrix(round(KT_merged))
   H0 <- hist_mat_from_matrix(round(K0))
@@ -170,6 +173,7 @@ fit_objects <- lapply(names(grouped_map), function(cond_name) {
     replicates = names(group),
     K0 = K0,
     KT = KT_merged,           
+    KT_list = KT_list,        # <--- NEW: Store the unmerged matrices here
     H0 = H0,
     HT = HT_merged,
     delta_pass = delta_pass
@@ -215,33 +219,37 @@ message("Simulation pipeline complete.")
 # --- Collect Results and Save to CSV ---
 ff <- list.files("data/fits/", full.names = TRUE)
 
-df <- do.call(rbind, lapply(ff, function(fi){
+df_list <- lapply(ff, function(fi){
   res <- readRDS(fi)
-  
-  # Skip if the run didn't finish the null test
   if(!"test_null_res" %in% names(res)) return(NULL)
   
-  # --- Logic to extract the Best Fit CIN Rate ---
-  # Find the row in the results dataframe with the lowest Negative Log Likelihood
+  # Get the Joint Best-Fit CIN Rate
   best_idx <- which.min(res$resdf$negll)
   best_cin_rate <- res$resdf$pmis[best_idx]
   
-  data.frame(
-    condition = res$id_end,       # The experimental condition (e.g., O_A3)
-    ancestor = res$id_start,      # The starting clone
-    p_value = res$test_null_res$empp, # Neutrality score
-    cin_rate = best_cin_rate,     # <--- The fitted mis-segregation rate
-    delta_pass = res$delta_pass
-  )
-}))
+  # Create a row for EACH independent replicate
+  replicate_rows <- lapply(names(res$test_null_res$individuals), function(rep_name) {
+    rep_res <- res$test_null_res$individuals[[rep_name]]
+    
+    data.frame(
+      condition = res$id_end,       # e.g., SUM..._O_harvest
+      replicate_id = rep_name,      # e.g., SUM..._O1_harvest
+      ancestor = res$id_start,
+      p_value = rep_res$empp,       # Independent p-value for THIS flask
+      cin_rate = best_cin_rate,     # The joint mechanistic rate
+      delta_pass = res$delta_pass
+    )
+  })
+  
+  do.call(rbind, replicate_rows)
+})
 
-# Sort by p-value for easier reading
-df <- df[order(df$p_value),]
-
-# Save the enhanced CSV
+# Combine all lists, sort, and save
+df <- do.call(rbind, df_list)
+df <- df[order(df$condition),]
 data.table::fwrite(df, "data/neutral_probability.csv", sep=",")
 
-# Preview the top results
+# Preview
 print(head(df))
 
 ```

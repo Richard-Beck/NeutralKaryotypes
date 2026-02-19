@@ -103,7 +103,7 @@ for (idx in seq_along(fit_objects)) {
   target_obj$pops <- pops
   saveRDS(pops, file.path(outputPops, paste0(target_obj$id_end, ".Rds")))
 
-  # --- Step 3: Null Hypothesis Testing ---
+  # --- Step 3: Null Hypothesis Testing (Hybrid Approach) ---
   message("  Step 3: Calculating Wasserstein Distances...")
   
   test_null <- function(pop, KT) {
@@ -115,7 +115,7 @@ for (idx in seq_along(fit_objects)) {
       list(coords = coords, counts = samstr)
     }
     
-    Nsam <- nrow(KT)
+    Nsam <- nrow(KT) # Dynamically matches the number of cells in the specific flask
     samstr <- table(apply(KT, 1, paste, collapse="."))
     smm <- list(
       coords = matrix(as.numeric(unlist(strsplit(names(samstr), split="[.]"))), ncol=22, byrow = TRUE),
@@ -151,9 +151,20 @@ for (idx in seq_along(fit_objects)) {
     list(dnull = dnull, dtst = dtst, empp = empp)
   }
   
-  target_obj$test_null_res <- test_null(target_obj$pops, round(KT))
+  # A. Test the merged population (Optional, but good for reference)
+  res_merged <- test_null(target_obj$pops, round(target_obj$KT))
   
-  # --- Step 4: Save ---
+  # B. Test EACH replicate independently against the shared Joint Null Model
+  res_indiv <- lapply(target_obj$KT_list, function(kt_indiv) {
+    test_null(target_obj$pops, round(kt_indiv))
+  })
+  
+  target_obj$test_null_res <- list(
+    merged = res_merged,
+    individuals = res_indiv
+  )
+  
+  # --- Step 4: Save & Clean ---
   target_obj$pops <- NULL 
   saveRDS(target_obj, out_file)
   
