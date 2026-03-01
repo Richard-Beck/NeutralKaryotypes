@@ -104,6 +104,11 @@ id_map <- lapply(id_an, function(lin1) {
 
 ```{r}
 karyotypes <- get_karyotyping(c(mrcas,ids))
+## Exclude marker chromosome:
+karyotypes$karyotype = sapply(karyotypes$karyotype, function(x) x[1:22], simplify = F)
+## Exclude pop-average resolution @TODO: should happen upstream
+keep = sapply(karyotypes$karyotype, function(x) !any(x -round(x) != 0))
+karyotypes <- tibble::tibble(id = karyotypes$id[which(keep)], karyotype = karyotypes$karyotype[which(keep)])
 ```
 
 ```{r}
