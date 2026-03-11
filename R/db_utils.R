@@ -60,6 +60,112 @@ get_karyotyping <- function(cloneIds){
   df
 }
 
+collapse_db <- function(x) {
+  required_cols <- c("id", "event", "passaged_from_id1")
+  missing_cols <- setdiff(required_cols, names(x))
+  if (length(missing_cols) > 0) {
+    stop("collapse_db() missing required columns: ",
+         paste(missing_cols, collapse = ", "))
+  }
+
+  if (anyDuplicated(x$id)) {
+    stop("collapse_db() requires unique values in x$id.")
+  }
+
+  x <- as.data.frame(x, stringsAsFactors = FALSE)
+  x$id <- as.character(x$id)
+  x$event <- as.character(x$event)
+  x$passaged_from_id1 <- as.character(x$passaged_from_id1)
+  x$passaged_from_id1[is.na(x$passaged_from_id1) | x$passaged_from_id1 == ""] <- NA_character_
+
+  valid_events <- c("seeding", "harvest")
+  bad_event_rows <- !(x$event %in% valid_events) | is.na(x$event)
+  if (any(bad_event_rows)) {
+    warning(
+      "collapse_db() stripped ", sum(bad_event_rows),
+      " rows with unsupported event values."
+    )
+    x <- x[!bad_event_rows, , drop = FALSE]
+  }
+
+  missing_parent_rows <- !is.na(x$passaged_from_id1) & !(x$passaged_from_id1 %in% x$id)
+  if (any(missing_parent_rows)) {
+    warning(
+      "collapse_db() stripped ", sum(missing_parent_rows),
+      " rows whose parent id was absent from x$id."
+    )
+    x <- x[!missing_parent_rows, , drop = FALSE]
+  }
+
+  root_rows <- is.na(x$passaged_from_id1)
+  is_passage_row <- x$event == "seeding" | root_rows
+  valid_passage_ids <- x$id[is_passage_row]
+  parent_lookup <- setNames(x$passaged_from_id1, x$id)
+
+  resolve_passage_id <- function(id, parent_map, valid_ids) {
+    cur <- id
+    visited <- character()
+    while (!is.null(cur) && !is.na(cur)) {
+      if (cur %in% visited) {
+        stop("collapse_db() detected a cycle while resolving passage ids.")
+      }
+      if (cur %in% valid_ids) return(cur)
+      visited <- c(visited, cur)
+      cur <- unname(parent_map[cur])
+    }
+    NA_character_
+  }
+
+  sample_passage_id <- vapply(
+    x$id,
+    resolve_passage_id,
+    character(1),
+    parent_map = parent_lookup,
+    valid_ids = valid_passage_ids
+  )
+
+  unresolved_rows <- is.na(sample_passage_id)
+  if (any(unresolved_rows)) {
+    warning(
+      "collapse_db() stripped ", sum(unresolved_rows),
+      " rows that could not be resolved to any upstream passage_id."
+    )
+    x <- x[!unresolved_rows, , drop = FALSE]
+    sample_passage_id <- sample_passage_id[!unresolved_rows]
+    root_rows <- root_rows[!unresolved_rows]
+    is_passage_row <- is_passage_row[!unresolved_rows]
+    valid_passage_ids <- valid_passage_ids[valid_passage_ids %in% x$id]
+    parent_lookup <- setNames(x$passaged_from_id1, x$id)
+  }
+
+  samples <- data.frame(
+    passage_id = sample_passage_id,
+    samples = x$id,
+    stringsAsFactors = FALSE
+  )
+
+  passaging_rows <- x[is_passage_row, , drop = FALSE]
+  parent_passage_id <- vapply(
+    passaging_rows$passaged_from_id1,
+    resolve_passage_id,
+    character(1),
+    parent_map = parent_lookup,
+    valid_ids = valid_passage_ids
+  )
+  parent_passage_id[is.na(passaging_rows$passaged_from_id1)] <- NA_character_
+
+  passaging <- data.frame(
+    passage_id = passaging_rows$id,
+    passage_from = unname(parent_passage_id),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    passaging = passaging,
+    samples = samples
+  )
+}
+
 recover_lineage <- function(row, data) {
   current_id <- row$last
   lineage <- c(current_id)

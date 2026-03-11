@@ -9,15 +9,6 @@ knitr::opts_knit$set(root.dir = "~/projects/021_ltee_models/NeutralKaryotypes/")
 ```
 
 
-```{r}
-ids <- readLines("karyotyped_samples.txt")
-
-mrcas <- c("SUM-159_NLS_4N_MRCA_harvest",
-           "MDA-MB-231_MRCA_harvest",
-           "HGC-27_MRCA_harvest",
-           "SUM-159_NLS_2N_MRCA_harvest",
-           "SNU-668_MRCA_harvest")
-```
 
 ```{r}
 require(DBI)
@@ -33,37 +24,248 @@ db <- dbConnect(
 
 x <- dbGetQuery(db, "SELECT * FROM Passaging")
 m <- dbGetQuery(db,"SELECT * FROM Media")
+db_col <- collapse_db(x) 
 
+saveRDS(db_col,"core_data/db_col.Rds")
 ```
-```{r}
 
-find_all_ancestors <- function(id,g){
-  ids <- c()
-    while(!is.na(id)){
-      ids <- c(id,ids)
-      id <- g$passaged_from_id1[g$id==id]
-    }
-  return(ids)
+```{r}
+ids <- unique(readLines("karyotyped_samples.txt"))
+ids <- intersect(ids, db_col$samples$samples)
+
+sample_map <- db_col$samples[match(ids, db_col$samples$samples), , drop = FALSE]
+sample_map <- unique(sample_map[, c("samples", "passage_id")])
+sample_map <- sample_map[order(sample_map$passage_id, sample_map$samples), ] 
+print(sample_map)
+
+passaging_tbl <- db_col$passaging
+parent_of <- setNames(passaging_tbl$passage_from, passaging_tbl$passage_id)
+unmapped_passage_ids <- setdiff(unique(sample_map$passage_id), passaging_tbl$passage_id)
+if (length(unmapped_passage_ids) > 0) {
+  warning(length(unmapped_passage_ids),
+          " sampled passage_id values are absent from db_col$passaging and will be skipped.")
 }
 
-mrca_an <- lapply(mrcas,find_all_ancestors,g=x)
-id_an <- lapply(ids,find_all_ancestors,g=x)
+find_passage_ancestors <- function(passage_id, parent_map) {
+  out <- character()
+  cur <- passage_id
+  while (!is.null(cur) && !is.na(cur)) {
+    out <- c(cur, out)
+    if (!(cur %in% names(parent_map))) break
+    cur <- unname(parent_map[cur])
+  }
+  out
+}
 
-## which mrca belongs to each id?
-id_map <- lapply(id_an,function(lin1){
-  ix <- which.max(sapply(mrca_an,function(lin2){
-    sum(lin1[1:length(lin2)]==lin2)
-  }))
-  
-  list(id_start=mrcas[ix],id_end=tail(lin1,1))
-  
+getfrom <- function(id) x$passaged_from_id1[x$id==id]
+tmp <- "MDA-MB-231_P_A2_seed" 
+tmp%in%db_col$passaging$passage_id
+find_passage_ancestors(tmp,parent_of)
+tmp_v <- c(tmp)
+while(!is.na(tmp_v[1])){
+  tmp_v <- c(getfrom(tmp_v[1]),tmp_v)
+}
+
+sampled_passage_ids <- setdiff(unique(sample_map$passage_id), unmapped_passage_ids)
+passage_paths <- setNames(
+  lapply(sampled_passage_ids, find_passage_ancestors, parent_map = parent_of),
+  sampled_passage_ids
+)
+root_id <- vapply(passage_paths, function(path) path[1], character(1))
+
+connected_passage_sets <- split(sampled_passage_ids, root_id)
+connected_sample_sets <- lapply(connected_passage_sets, function(pids) {
+  sample_map$samples[sample_map$passage_id %in% pids]
 })
 
+build_component_tree <- function(component_passage_ids, path_map, passaging_tbl, sample_map) {
+  subtree_nodes <- sort(unique(unlist(path_map[component_passage_ids])))
+  subtree_edges <- passaging_tbl[
+    passaging_tbl$passage_id %in% subtree_nodes,
+    c("passage_id", "passage_from"),
+    drop = FALSE
+  ]
+  subtree_samples <- sample_map[sample_map$passage_id %in% subtree_nodes, , drop = FALSE]
+
+  list(
+    sampled_passage_ids = sort(component_passage_ids),
+    sampled_ids = sort(unique(subtree_samples$samples[subtree_samples$passage_id %in% component_passage_ids])),
+    tree_passage_ids = subtree_nodes,
+    tree_edges = subtree_edges[order(subtree_edges$passage_id), , drop = FALSE],
+    tree_samples = subtree_samples[order(subtree_samples$passage_id, subtree_samples$samples), , drop = FALSE]
+  )
+}
+
+connected_trees <- lapply(connected_passage_sets, build_component_tree,
+                          path_map = passage_paths,
+                          passaging_tbl = passaging_tbl,
+                          sample_map = sample_map)
+
+component_summary <- do.call(rbind, lapply(seq_along(connected_trees), function(i) {
+  tree <- connected_trees[[i]]
+  data.frame(
+    component = names(connected_trees)[i],
+    n_sampled_passages = length(tree$sampled_passage_ids),
+    n_sampled_ids = length(tree$sampled_ids),
+    n_tree_passages = length(tree$tree_passage_ids),
+    stringsAsFactors = FALSE
+  )
+}))
+print(component_summary)
+
+# Example access:
+# connected_trees[[1]]$tree_edges
+# connected_trees[[1]]$tree_samples
+```
+
+```{r fig.width=10, fig.height=10}
+source("R/plot_utils.R")
+
+tree_plots <- lapply(seq_along(connected_trees), function(i) {
+  plot_passage_tree(
+    connected_trees[[i]],
+    component_name = names(connected_trees)[i]
+  )
+})
+names(tree_plots) <- names(connected_trees)
+
+invisible(lapply(tree_plots, print))
+
+```
+
+
+```{r}
+# Infer simulation intervals directly from the passaging graph.
+# For each pair of sampled endpoints, identify their MRCA in the passaging graph.
+# The sampled endpoint that is closer to that MRCA is used as a proxy for the
+# ancestral karyotype, while the other endpoint is treated as the descendant.
+
+ids <- intersect(ids, x$id)
+parent_of <- setNames(x$passaged_from_id1, x$id)
+
+find_all_ancestors <- function(id, parent_map) {
+  out <- character()
+  cur <- id
+  while (!is.null(cur) && !is.na(cur)) {
+    out <- c(cur, out)
+    cur <- parent_map[[cur]]
+  }
+  out
+}
+
+sampled_ancestors <- setNames(
+  lapply(ids, find_all_ancestors, parent_map = parent_of),
+  ids
+)
+
+shared_prefix_length <- function(path1, path2) {
+  n <- min(length(path1), length(path2))
+  if (n == 0) return(0L)
+  matches <- path1[seq_len(n)] == path2[seq_len(n)]
+  if (all(matches)) return(as.integer(n))
+  as.integer(which(!matches)[1] - 1)
+}
+
+build_pair_mapping <- function(sample1, sample2, ancestor_map, passaging_df) {
+  path1 <- ancestor_map[[sample1]]
+  path2 <- ancestor_map[[sample2]]
+
+  shared_len <- shared_prefix_length(path1, path2)
+  if (shared_len < 1) return(NULL)
+
+  mrca_id <- path1[shared_len]
+  steps1 <- length(path1) - shared_len - 1L
+  steps2 <- length(path2) - shared_len - 1L
+
+  if (steps1 <= steps2) {
+    ancestor_proxy_sample <- sample1
+    descendant_sample <- sample2
+    collapsed_steps <- steps1
+    descendant_steps <- steps2
+  } else {
+    ancestor_proxy_sample <- sample2
+    descendant_sample <- sample1
+    collapsed_steps <- steps2
+    descendant_steps <- steps1
+  }
+
+  delta_pass <- passaging_df$passage[passaging_df$id == descendant_sample] -
+    passaging_df$passage[passaging_df$id == mrca_id]
+  if (length(delta_pass) != 1 || is.na(delta_pass) || delta_pass <= 0) {
+    return(NULL)
+  }
+
+  list(
+    sample1 = sample1,
+    sample2 = sample2,
+    mrca_id = mrca_id,
+    sample1_steps_from_mrca = steps1,
+    sample2_steps_from_mrca = steps2,
+    ancestor_proxy_sample = ancestor_proxy_sample,
+    descendant_sample = descendant_sample,
+    collapsed_steps = collapsed_steps,
+    descendant_steps_from_mrca = descendant_steps,
+    delta_pass = delta_pass
+  )
+}
+
+pair_ids <- if (length(ids) >= 2) combn(ids, 2, simplify = FALSE) else list()
+id_map <- lapply(pair_ids, function(pair) {
+  build_pair_mapping(pair[1], pair[2], sampled_ancestors, x)
+})
+id_map <- id_map[!sapply(id_map, is.null)]
+
+interval_rows <- lapply(id_map, function(z) {
+  data.frame(
+    sample1 = z$sample1,
+    sample2 = z$sample2,
+    mrca_id = z$mrca_id,
+    ancestor_proxy_sample = z$ancestor_proxy_sample,
+    descendant_sample = z$descendant_sample,
+    collapsed_steps = z$collapsed_steps,
+    descendant_steps_from_mrca = z$descendant_steps_from_mrca,
+    delta_pass = z$delta_pass,
+    stringsAsFactors = FALSE
+  )
+})
+if (!length(interval_rows)) {
+  interval_df <- data.frame(
+    sample1 = character(),
+    sample2 = character(),
+    mrca_id = character(),
+    ancestor_proxy_sample = character(),
+    descendant_sample = character(),
+    collapsed_steps = numeric(),
+    descendant_steps_from_mrca = numeric(),
+    delta_pass = numeric(),
+    stringsAsFactors = FALSE
+  )
+} else {
+  interval_df <- do.call(rbind.data.frame, c(interval_rows, make.row.names = FALSE))
+  interval_df <- unique(interval_df)
+  interval_df$sample1 <- as.character(interval_df$sample1)
+  interval_df$sample2 <- as.character(interval_df$sample2)
+  interval_df$mrca_id <- as.character(interval_df$mrca_id)
+  interval_df$ancestor_proxy_sample <- as.character(interval_df$ancestor_proxy_sample)
+  interval_df$descendant_sample <- as.character(interval_df$descendant_sample)
+  interval_df$collapsed_steps <- as.numeric(interval_df$collapsed_steps)
+  interval_df$descendant_steps_from_mrca <- as.numeric(interval_df$descendant_steps_from_mrca)
+  interval_df$delta_pass <- as.numeric(interval_df$delta_pass)
+  interval_df <- interval_df[
+    order(interval_df$ancestor_proxy_sample, interval_df$descendant_sample),
+    ,
+    drop = FALSE
+  ]
+}
+print(interval_df)
 
 ```
 
 ```{r}
-karyotypes <- get_karyotyping(c(mrcas,ids))
+karyotype_ids <- unique(unlist(lapply(id_map, function(z) {
+  c(z$ancestor_proxy_sample, z$descendant_sample)
+})))
+karyotypes <- get_karyotyping(karyotype_ids)
 ```
 
 ```{r}
@@ -72,7 +274,11 @@ source("R/estimate_pmis.R")
 
 fit_objects <- lapply(id_map,function(id){
   
-  id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start])
+  id$id_start <- id$mrca_id
+  id$id_start_proxy <- id$ancestor_proxy_sample
+  id$id_end <- id$descendant_sample
+  
+  id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start_proxy])
   if(!id$id_end%in%karyotypes$id){
     print(id$id_end)
     return(NULL)
@@ -82,7 +288,6 @@ fit_objects <- lapply(id_map,function(id){
   id$H0 <- hist_mat_from_matrix(round(id$K0))
   id$HT <- hist_mat_from_matrix(round(id$KT))
   
-  id$delta_pass <- x$passage[x$id==id$id_end]-x$passage[x$id==id$id_start]
   id
 })
 fit_objects <- fit_objects[!sapply(fit_objects,is.null)]
