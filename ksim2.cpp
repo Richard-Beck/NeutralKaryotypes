@@ -30,6 +30,7 @@ static std::string kt_str(const std::vector<int> &kt){
 Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
                                  double rate,                // per-cell division rate
                                  double p_misseg,            // per-chromosome misseg prob
+                                 double p_wgd,              // whole-genome doubling event rate
                                  double dt,
                                  int    n_steps,
                                  long long max_pop = 0,      // must be >0 here (fixed pool)
@@ -39,6 +40,7 @@ Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
 {
   if (max_pop <= 0) Rcpp::stop("max_pop must be > 0 (fixed preallocation only).");
   if (p_misseg < 0.0 || p_misseg > 1.0) Rcpp::stop("p_misseg must be in [0,1].");
+  if (p_wgd < 0.0 || p_wgd > 1.0) Rcpp::stop("p_wgd must be in [0,1].");
   cull_keep = std::max(0.0, std::min(1.0, cull_keep));
   
   // RNG
@@ -122,7 +124,8 @@ Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
     Npop = std::min<long long>(keep, max_pop);
   };
   
-  // Division with balanced misseg (per-chromosome) and 3-case outcome
+  // Division with copy-number dependent misseg and optional WGD.
+  // State 0 is absorbing for misseg because x * p_misseg = 0 when x = 0.
   enum class DivResult { AppendedNew, OverwriteOnly, RemovedParent };
   auto divide_balanced_3case = [&](long long parent_row, long long append_row) -> DivResult {
     unsigned char* p = row_ptr(parent_row);
@@ -130,20 +133,37 @@ Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
     // build daughters as int scratch (to allow negatives during proposal)
     std::array<int, 64> d1, d2; // 64 > 22
     for (int j=0;j<K;++j){ d1[j] = (int)p[j]; d2[j] = (int)p[j]; }
+
+    auto valid = [&](const std::array<int,64>& d){
+      for (int j=0;j<K;++j) if (d[j] < 0 || d[j] > 8) return false;
+      return true;
+    };
+
+    if (U(rng) < p_wgd) {
+      bool keeps_doubled_state = U(rng) < 0.5;
+      if (!keeps_doubled_state) {
+        return DivResult::RemovedParent;
+      }
+      for (int j=0;j<K;++j) d1[j] = 2 * (int)p[j];
+      if (!valid(d1)) {
+        return DivResult::RemovedParent;
+      }
+      unsigned char* a = row_ptr(parent_row);
+      for (int j=0;j<K;++j) a[j] = (unsigned char)d1[j];
+      return DivResult::OverwriteOnly;
+    }
     
-    // balanced misseg per chromosome (no clamping)
+    // balanced misseg per chromosome with per-copy event probability
     for (int j=0;j<K;++j){
-      if (U(rng) < p_misseg){
+      double p_chr = p_misseg * (double)p[j];
+      if (p_chr > 1.0) p_chr = 1.0;
+      if (U(rng) < p_chr){
         int s = sign01(rng) ? +1 : -1;
         d1[j] += s;
         d2[j] -= s;
       }
     }
-    
-    auto valid = [&](const std::array<int,64>& d){
-      for (int j=0;j<K;++j) if (d[j] < 0 || d[j] > 8) return false;
-      return true;
-    };
+
     bool v1 = valid(d1), v2 = valid(d2);
     
     if (v1 && v2){

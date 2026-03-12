@@ -62,15 +62,28 @@ plot_passage_tree <- function(tree, component_name = NULL) {
   sample_counts <- table(tree$tree_samples$passage_id)
   node_ids <- unique(c(as.character(edge_df$passage_id), as.character(edge_df$passage_from)))
   node_ids <- node_ids[!is.na(node_ids)]
+  condition_df <- tree$tree_conditions
+  if (is.null(condition_df)) {
+    condition_df <- data.frame(
+      passage_id = character(),
+      condition = character(),
+      stringsAsFactors = FALSE
+    )
+  }
 
   meta <- data.frame(
     label = node_ids,
     stringsAsFactors = FALSE
   ) %>%
     dplyr::distinct() %>%
+    dplyr::left_join(
+      condition_df[, intersect(c("passage_id", "condition"), names(condition_df)), drop = FALSE],
+      by = c("label" = "passage_id")
+    ) %>%
     dplyr::mutate(
       karyotyped = label %in% sampled_passages,
-      sample_count = as.integer(sample_counts[label])
+      sample_count = as.integer(sample_counts[label]),
+      condition = ifelse(is.na(condition), "Unannotated", condition)
     )
 
   meta$sample_count[is.na(meta$sample_count)] <- 0L
@@ -79,28 +92,28 @@ plot_passage_tree <- function(tree, component_name = NULL) {
   p$data <- dplyr::left_join(p$data, meta, by = "label")
   p$data$karyotyped[is.na(p$data$karyotyped)] <- FALSE
   p$data$sample_count[is.na(p$data$sample_count)] <- 0L
+  p$data$condition[is.na(p$data$condition)] <- "Unannotated"
   p$data$highlight <- !is.na(p$data$label) & p$data$label %in% sampled_passages
 
   p <- p +
     geom_point2(
-      data = ~ dplyr::filter(.x, !is.na(label)),
-      aes(size = pmax(sample_count, 1L)),
+      data = ~ dplyr::filter(.x, !is.na(label) & !highlight),
+      aes(
+        color = condition
+      ),
+      size = 2.2,
       shape = 16,
-      color = "grey70",
       alpha = 0.9
     ) +
     geom_point2(
       data = ~ dplyr::filter(.x, highlight),
-      aes(shape = "karyotyped"),
-      color = "#c83e4d",
-      size = 3.4
+      shape = 17,
+      size = 2.8,
+      color = "red",
+      alpha = 0.95,
+      show.legend = FALSE
     ) +
-    scale_size_continuous(
-      range = c(1.3, 3.2),
-      breaks = c(1, 2, 3, 5),
-      name = "Samples"
-    ) +
-    scale_shape_discrete("") +
+    guides(color = guide_legend(override.aes = list(shape = 16, size = 3))) +
     theme_void() +
     ggtitle(if (is.null(component_name)) "Connected passage tree" else paste("Connected passage tree:", component_name))
 

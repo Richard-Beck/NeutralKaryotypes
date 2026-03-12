@@ -57,11 +57,12 @@ get_karyotyping <- function(cloneIds){
     id = res$origin,
     karyotype = kvecs
   )
+  df <- df[!res$hasChildren==1,] ## this SHOULD exclude the population average entry (...?)
   df
 }
 
 collapse_db <- function(x) {
-  required_cols <- c("id", "event", "passaged_from_id1")
+  required_cols <- c("id", "event", "passaged_from_id1", "media")
   missing_cols <- setdiff(required_cols, names(x))
   if (length(missing_cols) > 0) {
     stop("collapse_db() missing required columns: ",
@@ -76,7 +77,9 @@ collapse_db <- function(x) {
   x$id <- as.character(x$id)
   x$event <- as.character(x$event)
   x$passaged_from_id1 <- as.character(x$passaged_from_id1)
+  x$media <- as.character(x$media)
   x$passaged_from_id1[is.na(x$passaged_from_id1) | x$passaged_from_id1 == ""] <- NA_character_
+  x$media[is.na(x$media) | x$media == ""] <- NA_character_
 
   valid_events <- c("seeding", "harvest")
   bad_event_rows <- !(x$event %in% valid_events) | is.na(x$event)
@@ -141,6 +144,7 @@ collapse_db <- function(x) {
   samples <- data.frame(
     passage_id = sample_passage_id,
     samples = x$id,
+    media_id = x$media,
     stringsAsFactors = FALSE
   )
 
@@ -164,6 +168,254 @@ collapse_db <- function(x) {
     passaging = passaging,
     samples = samples
   )
+}
+
+build_media_col <- function(samples, media_tbl) {
+  if (is.data.frame(samples)) {
+    if (!("media_id" %in% names(samples))) {
+      stop("build_media_col() requires a 'media_id' column when samples is a data.frame.")
+    }
+    media_ids <- unique(as.character(samples$media_id))
+  } else {
+    media_ids <- unique(as.character(samples))
+  }
+
+  media_ids <- media_ids[!is.na(media_ids) & nzchar(media_ids)]
+
+  if (!is.data.frame(media_tbl) || !("id" %in% names(media_tbl))) {
+    stop("build_media_col() requires media_tbl to be a data.frame containing an 'id' column.")
+  }
+
+  out <- media_tbl[media_tbl$id %in% media_ids, , drop = FALSE]
+  if (!nrow(out)) {
+    out <- media_tbl[FALSE, , drop = FALSE]
+  }
+
+  names(out)[names(out) == "id"] <- "media_id"
+  keep_cols <- vapply(out, function(col) length(unique(col)) > 1L, logical(1))
+  out[, keep_cols, drop = FALSE]
+}
+
+extract_karyotyped_intervals <- function(tree) {
+  required_tree_fields <- c("sampled_passage_ids", "tree_edges", "tree_conditions")
+  missing_tree_fields <- setdiff(required_tree_fields, names(tree))
+  if (length(missing_tree_fields) > 0) {
+    stop(
+      "extract_karyotyped_intervals() missing required tree fields: ",
+      paste(missing_tree_fields, collapse = ", ")
+    )
+  }
+
+  edge_df <- tree$tree_edges
+  if (!all(c("passage_id", "passage_from") %in% names(edge_df))) {
+    stop("extract_karyotyped_intervals() requires tree$tree_edges to contain 'passage_id' and 'passage_from'.")
+  }
+
+  condition_df <- tree$tree_conditions
+  if (!all(c("passage_id", "condition") %in% names(condition_df))) {
+    stop("extract_karyotyped_intervals() requires tree$tree_conditions to contain 'passage_id' and 'condition'.")
+  }
+
+  parent_of <- setNames(as.character(edge_df$passage_from), as.character(edge_df$passage_id))
+  condition_of <- setNames(as.character(condition_df$condition), as.character(condition_df$passage_id))
+  karyotyped_ids <- unique(as.character(tree$sampled_passage_ids))
+
+  find_direct_karyotyped_ancestor <- function(node_id, parent_map, sampled_ids) {
+    cur <- unname(parent_map[node_id])
+    while (!is.na(cur) && !(cur %in% sampled_ids)) {
+      cur <- unname(parent_map[cur])
+    }
+    if (is.na(cur)) {
+      return(NULL)
+    }
+    cur
+  }
+
+  get_path_between <- function(start_id, end_id, parent_map) {
+    out <- end_id
+    cur <- end_id
+    visited <- character()
+
+    while (!identical(cur, start_id)) {
+      if (cur %in% visited) {
+        stop("extract_karyotyped_intervals() detected a cycle while traversing ancestry.")
+      }
+      visited <- c(visited, cur)
+      cur <- unname(parent_map[cur])
+      if (is.null(cur) || is.na(cur)) {
+        stop("Passage ", start_id, " is not an ancestor of ", end_id, ".")
+      }
+      out <- c(cur, out)
+    }
+
+    out
+  }
+
+  is_valid_direct_interval <- function(start_id, end_id, parent_map, sampled_ids) {
+    path_ids <- tryCatch(
+      get_path_between(start_id, end_id, parent_map),
+      error = function(e) NULL
+    )
+    if (is.null(path_ids)) {
+      return(FALSE)
+    }
+
+    intermediate_ids <- setdiff(path_ids, c(start_id, end_id))
+    !any(intermediate_ids %in% sampled_ids)
+  }
+
+  build_interval <- function(start_id, end_id, start_alias = NULL) {
+    if (is.null(start_alias)) {
+      path_ids <- get_path_between(start_id, end_id, parent_of)
+    } else {
+      path_ids <- c(start_id, get_path_between(start_alias, end_id, parent_of))
+    }
+    path_conditions <- condition_of[path_ids]
+    path_conditions[is.na(path_conditions) | !nzchar(path_conditions)] <- "Unannotated"
+
+    list(
+      start = start_id,
+      end = end_id,
+      start_alias = start_alias,
+      n_collapsed_passages = if (is.null(start_alias)) 0L else 1L,
+      conditions = table(path_conditions)
+    )
+  }
+
+  direct_intervals <- lapply(karyotyped_ids, function(end_id) {
+    direct_start <- find_direct_karyotyped_ancestor(end_id, parent_of, karyotyped_ids)
+    if (!is.null(direct_start)) {
+      return(build_interval(direct_start, end_id, start_alias = NULL))
+    }
+    NULL
+  })
+  direct_intervals <- direct_intervals[!vapply(direct_intervals, is.null, logical(1))]
+
+  valid_direct_starts <- unique(vapply(direct_intervals, `[[`, character(1), "start"))
+  endpoints_with_direct_start <- unique(vapply(direct_intervals, `[[`, character(1), "end"))
+
+  alias_intervals <- list()
+  alias_idx <- 1L
+  proxy_starts <- setdiff(karyotyped_ids, valid_direct_starts)
+  for (proxy_start in proxy_starts) {
+    start_alias <- unname(parent_of[proxy_start])
+    if (is.null(start_alias) || is.na(start_alias)) {
+      next
+    }
+
+    candidate_ends <- setdiff(karyotyped_ids, c(proxy_start, endpoints_with_direct_start))
+    for (end_id in candidate_ends) {
+      if (!is_valid_direct_interval(start_alias, end_id, parent_of, karyotyped_ids)) {
+        next
+      }
+
+      alias_intervals[[alias_idx]] <- build_interval(
+        start_id = proxy_start,
+        end_id = end_id,
+        start_alias = start_alias
+      )
+      alias_idx <- alias_idx + 1L
+    }
+  }
+
+  intervals <- c(direct_intervals, alias_intervals)
+  if (!length(intervals)) {
+    return(intervals)
+  }
+
+  interval_keys <- vapply(intervals, function(interval) {
+    paste(interval$start, interval$end, if (is.null(interval$start_alias)) "NULL" else interval$start_alias, sep = "||")
+  }, character(1))
+  intervals[!duplicated(interval_keys)]
+}
+
+resolve_interval_condition <- function(condition_counts) {
+  condition_names <- names(condition_counts)
+  if (!length(condition_names)) {
+    return("unknown")
+  }
+
+  if (length(condition_names) == 1L) {
+    return(condition_names[1])
+  }
+
+  if (length(condition_names) == 2L && "control" %in% condition_names) {
+    return(setdiff(condition_names, "control")[1])
+  }
+
+  "unknown"
+}
+
+build_simulation_intervals <- function(connected_trees, karyotypes = NULL) {
+  if (is.null(names(connected_trees))) {
+    names(connected_trees) <- as.character(seq_along(connected_trees))
+  }
+
+  empty_karyotype <- matrix(NA_real_, nrow = 1, ncol = 1)
+  keep_chr_idx <- 1:22
+
+  karyotype_matrix_for_ids <- function(sample_ids, karyotype_tbl) {
+    sample_ids <- unique(as.character(sample_ids))
+    sample_ids <- sample_ids[!is.na(sample_ids) & nzchar(sample_ids)]
+
+    if (!length(sample_ids) || is.null(karyotype_tbl)) {
+      return(empty_karyotype)
+    }
+
+    if (!all(c("id", "karyotype") %in% names(karyotype_tbl))) {
+      stop("build_simulation_intervals() requires karyotypes to contain 'id' and 'karyotype' columns.")
+    }
+
+    rows <- karyotype_tbl[as.character(karyotype_tbl$id) %in% sample_ids, , drop = FALSE]
+    if (!nrow(rows)) {
+      return(empty_karyotype)
+    }
+
+    kmat <- do.call(rbind, lapply(rows$karyotype, function(k) as.numeric(unlist(k))))
+    kmat <- as.matrix(kmat)
+    if (ncol(kmat) < max(keep_chr_idx)) {
+      stop("build_simulation_intervals() expected at least 22 chromosome columns in karyotypes.")
+    }
+    kmat <- kmat[, keep_chr_idx, drop = FALSE]
+    rownames(kmat) <- make.unique(as.character(rows$id))
+    kmat
+  }
+
+  intervals_by_tree <- lapply(seq_along(connected_trees), function(i) {
+    tree_name <- names(connected_trees)[i]
+    tree <- connected_trees[[i]]
+    tree_intervals <- extract_karyotyped_intervals(tree)
+
+    lapply(tree_intervals, function(interval) {
+      start_ids <- tree$tree_samples$samples[tree$tree_samples$passage_id == interval$start]
+      end_ids <- tree$tree_samples$samples[tree$tree_samples$passage_id == interval$end]
+
+      interval$connected_tree <- tree_name
+      interval$condition <- resolve_interval_condition(interval$conditions)
+      interval$elapsed_passages <- as.integer(sum(interval$conditions))
+      interval$start_ids <- unique(as.character(start_ids))
+      interval$end_ids <- unique(as.character(end_ids))
+      interval$start_karyotype <- karyotype_matrix_for_ids(interval$start_ids, karyotypes)
+      interval$end_karyotype <- karyotype_matrix_for_ids(interval$end_ids, karyotypes)
+      interval
+    })
+  })
+
+  unlist(intervals_by_tree, recursive = FALSE)
+}
+
+group_simulation_intervals <- function(simulation_intervals, divisions_per_passage = 5L) {
+  if (!length(simulation_intervals)) {
+    return(list())
+  }
+
+  intervals <- lapply(simulation_intervals, function(interval) {
+    interval$n_divisions <- as.integer(interval$elapsed_passages * divisions_per_passage)
+    interval$group_id <- paste(interval$connected_tree, interval$condition, sep = "||")
+    interval
+  })
+
+  split(intervals, vapply(intervals, `[[`, character(1), "group_id"))
 }
 
 recover_lineage <- function(row, data) {
