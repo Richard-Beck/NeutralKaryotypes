@@ -1,3 +1,6 @@
+# Read database credentials from a simple KEY=value file.
+# Input: `filepath` path to a text file containing HOST, DBNAME, USER, PASSWORD.
+# Output: named character vector of credential values.
 load_db_vars <- function(filepath) {
   if (!file.exists(filepath)) {
     stop(sprintf("Error: File '%s' does not exist.", filepath))
@@ -28,6 +31,9 @@ load_db_vars <- function(filepath) {
   return(vars)
 }
 
+# Fetch per-sample karyotype vectors from the database.
+# Input: `cloneIds` character vector of sample ids to query.
+# Output: tibble with columns `id` and list-column `karyotype`.
 get_karyotyping <- function(cloneIds){
   require(DBI)
   require(RMariaDB)
@@ -61,6 +67,9 @@ get_karyotyping <- function(cloneIds){
   df
 }
 
+# Collapse raw passaging records to a passage-level ancestry graph.
+# Input: `x` data.frame containing `id`, `event`, `passaged_from_id1`, and `media`.
+# Output: list with `passaging` edges and `samples` mapping raw ids to collapsed passages.
 collapse_db <- function(x) {
   required_cols <- c("id", "event", "passaged_from_id1", "media")
   missing_cols <- setdiff(required_cols, names(x))
@@ -170,6 +179,9 @@ collapse_db <- function(x) {
   )
 }
 
+# Subset the media table to the media ids used in a sample set.
+# Inputs: `samples` vector or data.frame containing media ids, `media_tbl` raw media table.
+# Output: reduced media data.frame with `media_id` replacing `id`.
 build_media_col <- function(samples, media_tbl) {
   if (is.data.frame(samples)) {
     if (!("media_id" %in% names(samples))) {
@@ -196,6 +208,9 @@ build_media_col <- function(samples, media_tbl) {
   out[, keep_cols, drop = FALSE]
 }
 
+# Extract ancestor-descendant intervals between karyotyped passages in one tree.
+# Input: `tree` list containing sampled passages, tree edges, and tree conditions.
+# Output: list of interval records with start/end passages and path conditions.
 extract_karyotyped_intervals <- function(tree) {
   required_tree_fields <- c("sampled_passage_ids", "tree_edges", "tree_conditions")
   missing_tree_fields <- setdiff(required_tree_fields, names(tree))
@@ -329,6 +344,9 @@ extract_karyotyped_intervals <- function(tree) {
   intervals[!duplicated(interval_keys)]
 }
 
+# Collapse a path-level condition table to one interval label.
+# Input: `condition_counts` named table of conditions along an interval.
+# Output: scalar character condition label.
 resolve_interval_condition <- function(condition_counts) {
   condition_names <- names(condition_counts)
   if (!length(condition_names)) {
@@ -346,6 +364,9 @@ resolve_interval_condition <- function(condition_counts) {
   "unknown"
 }
 
+# Add karyotype matrices and metadata to tree-derived intervals.
+# Inputs: `connected_trees` list and optional `karyotypes` table with `id` and `karyotype`.
+# Output: flat list of simulation-ready interval records.
 build_simulation_intervals <- function(connected_trees, karyotypes = NULL) {
   if (is.null(names(connected_trees))) {
     names(connected_trees) <- as.character(seq_along(connected_trees))
@@ -404,6 +425,9 @@ build_simulation_intervals <- function(connected_trees, karyotypes = NULL) {
   unlist(intervals_by_tree, recursive = FALSE)
 }
 
+# Group intervals into shared parameter sets.
+# Inputs: `simulation_intervals` list and `divisions_per_passage` scalar integer.
+# Output: named list of interval groups keyed by connected tree and condition.
 group_simulation_intervals <- function(simulation_intervals, divisions_per_passage = 5L) {
   if (!length(simulation_intervals)) {
     return(list())
@@ -418,6 +442,9 @@ group_simulation_intervals <- function(simulation_intervals, divisions_per_passa
   split(intervals, vapply(intervals, `[[`, character(1), "group_id"))
 }
 
+# Recover one raw lineage between two samples and annotate simple growth fits.
+# Inputs: `row` containing `first`/`last` ids, `data` raw passaging table.
+# Output: data.frame of lineage rows with fitted growth columns added.
 recover_lineage <- function(row, data) {
   current_id <- row$last
   lineage <- c(current_id)
@@ -459,6 +486,9 @@ recover_lineage <- function(row, data) {
 }
 
 
+# Fill missing lineage segments for a SUM-159 subset in legacy exploratory analysis.
+# Inputs: ploidy substring, current lineage data.frame, and raw passaging table `x`.
+# Output: filtered data.frame of lineage rows to append.
 fill_lineage_gaps <- function(ploidy_substr,df,x){
   g <- x[x$cellLine=="SUM-159",c("id","passaged_from_id1")]
   

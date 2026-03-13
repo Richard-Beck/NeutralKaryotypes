@@ -1,3 +1,6 @@
+# Convert a parent-child edge table into a phylo object.
+# Inputs: edge data.frame and optional column names / edge-length callback.
+# Output: `ape::phylo` tree.
 edge_df_to_phylo <- function(df, id_col = "passage_id", parent_col = "passage_from", edge_length = NULL) {
   library(dplyr)
   library(ape)
@@ -50,6 +53,9 @@ edge_df_to_phylo <- function(df, id_col = "passage_id", parent_col = "passage_fr
   phy
 }
 
+# Plot one connected passage tree with conditions and karyotyped passages highlighted.
+# Inputs: `tree` list from the workflow and optional `component_name`.
+# Output: `ggtree` plot object.
 plot_passage_tree <- function(tree, component_name = NULL) {
   library(dplyr)
   library(ggplot2)
@@ -120,6 +126,9 @@ plot_passage_tree <- function(tree, component_name = NULL) {
   p
 }
 
+# Plot a legacy experimental lineage colored by fitted growth rate.
+# Input: `lineage_df_subset` edge table with metadata columns used in the plot.
+# Output: `ggtree` plot object.
 experiment_lineage_plot <- function(lineage_df_subset){
   library(dplyr)
   library(ggplot2)
