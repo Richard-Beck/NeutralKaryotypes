@@ -30,15 +30,18 @@ static std::string kt_str(const std::vector<int> &kt){
 Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
                                  double rate,                // per-cell division rate
                                  double p_misseg,            // per-chromosome misseg prob
+                                 double p_wgd,              // whole-genome doubling event rate
                                  double dt,
                                  int    n_steps,
                                  long long max_pop = 0,      // must be >0 here (fixed pool)
                                  double cull_keep = 0.1,     // keep fraction on cull (0..1]
                                  int    record_every = 1,
+                                 bool   divide_all_each_step = false,
                                  int    seed = -1)
 {
   if (max_pop <= 0) Rcpp::stop("max_pop must be > 0 (fixed preallocation only).");
   if (p_misseg < 0.0 || p_misseg > 1.0) Rcpp::stop("p_misseg must be in [0,1].");
+  if (p_wgd < 0.0 || p_wgd > 1.0) Rcpp::stop("p_wgd must be in [0,1].");
   cull_keep = std::max(0.0, std::min(1.0, cull_keep));
   
   // RNG
@@ -122,46 +125,62 @@ Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
     Npop = std::min<long long>(keep, max_pop);
   };
   
-  // Division with balanced misseg (per-chromosome) and 3-case outcome
+  // Division with copy-number dependent misseg and optional WGD.
+  // State 0 is absorbing for misseg because x * p_misseg = 0 when x = 0.
   enum class DivResult { AppendedNew, OverwriteOnly, RemovedParent };
-  auto divide_balanced_3case = [&](long long parent_row, long long append_row) -> DivResult {
-    unsigned char* p = row_ptr(parent_row);
-    
-    // build daughters as int scratch (to allow negatives during proposal)
-    std::array<int, 64> d1, d2; // 64 > 22
+  auto valid = [&](const std::array<int,64>& d){
+    for (int j=0;j<K;++j) if (d[j] < 0 || d[j] > 8) return false;
+    return true;
+  };
+  auto propose_daughters = [&](const unsigned char* p,
+                               std::array<int,64>& d1,
+                               std::array<int,64>& d2) -> DivResult {
     for (int j=0;j<K;++j){ d1[j] = (int)p[j]; d2[j] = (int)p[j]; }
-    
-    // balanced misseg per chromosome (no clamping)
+
+    if (U(rng) < p_wgd) {
+      bool keeps_doubled_state = U(rng) < 0.5;
+      if (!keeps_doubled_state) {
+        return DivResult::RemovedParent;
+      }
+      for (int j=0;j<K;++j) d1[j] = 2 * (int)p[j];
+      if (!valid(d1)) {
+        return DivResult::RemovedParent;
+      }
+      return DivResult::OverwriteOnly;
+    }
+
     for (int j=0;j<K;++j){
-      if (U(rng) < p_misseg){
+      double p_chr = p_misseg * (double)p[j];
+      if (p_chr > 1.0) p_chr = 1.0;
+      if (U(rng) < p_chr){
         int s = sign01(rng) ? +1 : -1;
         d1[j] += s;
         d2[j] -= s;
       }
     }
-    
-    auto valid = [&](const std::array<int,64>& d){
-      for (int j=0;j<K;++j) if (d[j] < 0 || d[j] > 8) return false;
-      return true;
-    };
+
     bool v1 = valid(d1), v2 = valid(d2);
-    
-    if (v1 && v2){
-      // both valid: parent <- d1, append d2
+    if (v1 && v2) return DivResult::AppendedNew;
+    if (v1 || v2) return DivResult::OverwriteOnly;
+    return DivResult::RemovedParent;
+  };
+  auto divide_balanced_3case = [&](long long parent_row, long long append_row) -> DivResult {
+    unsigned char* p = row_ptr(parent_row);
+    std::array<int, 64> d1, d2; // 64 > 22
+    DivResult proposal = propose_daughters(p, d1, d2);
+
+    if (proposal == DivResult::AppendedNew){
       unsigned char* a = row_ptr(parent_row);
       unsigned char* b = row_ptr(append_row);
       for (int j=0;j<K;++j){ a[j] = (unsigned char)d1[j]; b[j] = (unsigned char)d2[j]; }
-      return DivResult::AppendedNew;
-    } else if (v1 ^ v2){
-      // one valid: overwrite parent with valid, no append
-      const auto& dv = v1 ? d1 : d2;
+      return proposal;
+    } else if (proposal == DivResult::OverwriteOnly){
+      const auto& dv = valid(d1) ? d1 : d2;
       unsigned char* a = row_ptr(parent_row);
       for (int j=0;j<K;++j) a[j] = (unsigned char)dv[j];
-      return DivResult::OverwriteOnly;
-    } else {
-      // both invalid: remove the parent
-      return DivResult::RemovedParent;
+      return proposal;
     }
+    return proposal;
   };
   
   // Output container
@@ -173,58 +192,94 @@ Rcpp::List run_karyotype_neutral(Rcpp::NumericVector initial_counts_named,
   for (int t=1; t<=n_steps; ++t){
     if (Npop == 0) break;
     
-    // Poisson number of division events this step
-    double lambda = rate * dt * (double)Npop;
-    long long n_events = 0;
-    if (lambda <= 0.0) {
-      n_events = 0;
-    } else if (lambda < 20.0){
-      // Knuth
-      double L = std::exp(-lambda), p = 1.0; n_events = -1;
-      do { ++n_events; p *= U(rng); } while (p > L);
+    if (divide_all_each_step) {
+      long long start_Npop = Npop;
+      std::vector<unsigned char> appended;
+      appended.reserve((size_t)start_Npop * (size_t)K);
+      long long survivors = 0;
+
+      for (long long parent=0; parent<start_Npop; ++parent){
+        std::array<int, 64> d1, d2;
+        DivResult res = propose_daughters(row_ptr(parent), d1, d2);
+
+        if (res == DivResult::AppendedNew){
+          unsigned char* dst = row_ptr(survivors);
+          for (int j=0;j<K;++j) dst[j] = (unsigned char)d1[j];
+          ++survivors;
+          for (int j=0;j<K;++j) appended.push_back((unsigned char)d2[j]);
+        } else if (res == DivResult::OverwriteOnly){
+          const auto& dv = valid(d1) ? d1 : d2;
+          unsigned char* dst = row_ptr(survivors);
+          for (int j=0;j<K;++j) dst[j] = (unsigned char)dv[j];
+          ++survivors;
+        }
+        // RemovedParent contributes no survivors.
+      }
+
+      Npop = survivors;
+      long long n_appended = (long long)appended.size() / (long long)K;
+      for (long long i=0; i<n_appended && Npop < max_pop; ++i){
+        unsigned char* dst = row_ptr(Npop);
+        const unsigned char* src = &appended[(size_t)i * (size_t)K];
+        std::memcpy(dst, src, (size_t)K);
+        ++Npop;
+      }
+
+      if (Npop >= max_pop && cull_keep > 0.0) cull_shuffle_truncate();
     } else {
-      // Normal approximation (simple & fast)
-      std::normal_distribution<double> N(lambda, std::sqrt(lambda));
-      double x = std::max(0.0, N(rng));
-      n_events = (long long)std::llround(x);
-    }
-    
-    // If full and we might need to append, cull ahead of time
-    if (Npop >= max_pop && cull_keep > 0.0) cull_shuffle_truncate();
-    
-    // Execute events
-    for (long long e=0; e<n_events; ++e){
-      if (Npop == 0) break;
-      
-      // Ensure space to append if the event yields a second daughter
-      if (Npop >= max_pop && cull_keep > 0.0) {
-        cull_shuffle_truncate();
+      // Poisson number of division events this step
+      double lambda = rate * dt * (double)Npop;
+      long long n_events = 0;
+      if (lambda <= 0.0) {
+        n_events = 0;
+      } else if (lambda < 20.0){
+        // Knuth
+        double L = std::exp(-lambda), p = 1.0; n_events = -1;
+        do { ++n_events; p *= U(rng); } while (p > L);
+      } else {
+        // Normal approximation (simple & fast)
+        std::normal_distribution<double> N(lambda, std::sqrt(lambda));
+        double x = std::max(0.0, N(rng));
+        n_events = (long long)std::llround(x);
+      }
+
+      // If full and we might need to append, cull ahead of time
+      if (Npop >= max_pop && cull_keep > 0.0) cull_shuffle_truncate();
+
+      // Execute events
+      for (long long e=0; e<n_events; ++e){
         if (Npop == 0) break;
-      }
-      
-      std::uniform_int_distribution<long long> I(0, Npop-1);
-      long long parent = I(rng);
-      
-      // Attempt division with 3-case rule
-      DivResult res = divide_balanced_3case(parent, Npop); // append target is Npop
-      if (res == DivResult::AppendedNew){
-        if (Npop < max_pop){
-          ++Npop; // appended the second daughter
-        } else {
-          // No room to append; treat as overwrite-only fallback
-          // (this occurs only if cull_keep==0 or max_pop==Npop post-cull)
+
+        // Ensure space to append if the event yields a second daughter
+        if (Npop >= max_pop && cull_keep > 0.0) {
+          cull_shuffle_truncate();
+          if (Npop == 0) break;
         }
-      } else if (res == DivResult::RemovedParent){
-        // Parent dies: overwrite with last live row and shrink
-        if (Npop == 1){
-          Npop = 0;
-          break;
-        } else {
-          swap_rows(parent, Npop-1);
-          --Npop;
+
+        std::uniform_int_distribution<long long> I(0, Npop-1);
+        long long parent = I(rng);
+
+        // Attempt division with 3-case rule
+        DivResult res = divide_balanced_3case(parent, Npop); // append target is Npop
+        if (res == DivResult::AppendedNew){
+          if (Npop < max_pop){
+            ++Npop; // appended the second daughter
+          } else {
+            // No room to append; treat as overwrite-only fallback
+            // (this occurs only if cull_keep==0 or max_pop==Npop post-cull)
+          }
+        } else if (res == DivResult::RemovedParent){
+          // Parent dies: overwrite with last live row and shrink
+          if (Npop == 1){
+            Npop = 0;
+            break;
+          } else {
+            swap_rows(parent, Npop-1);
+            --Npop;
+          }
         }
+        // OverwriteOnly: nothing else to do
       }
-      // OverwriteOnly: nothing else to do
     }
     
     // Optional: if you want to cull exactly at/above cap after events
