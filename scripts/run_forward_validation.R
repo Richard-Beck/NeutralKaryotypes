@@ -171,6 +171,11 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
   saveRDS(forward_validation_summary_object(out), summary_output_path)
   message("Saved forward validation to ", output_path)
   message("Saved forward validation summary to ", summary_output_path)
+  write_neutral_probability_csv(
+    summary_dir = dirname(summary_output_path),
+    grouped_intervals_path = grouped_intervals_path,
+    output_path = "data/neutral_probability.csv"
+  )
   out
 }
 

@@ -59,6 +59,12 @@ run_forward_validation_all_main <- function(grouped_intervals_path = "core_data/
     result_paths[i] <- output_path
   }
 
+  write_neutral_probability_csv(
+    summary_dir = summary_output_dir,
+    grouped_intervals_path = grouped_intervals_path,
+    output_path = "data/neutral_probability.csv"
+  )
+
   invisible(result_paths)
 }
 
