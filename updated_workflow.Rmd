@@ -11,15 +11,16 @@ knitr::opts_knit$set(root.dir = "/Users/4470246/Repositories/NeutralKaryotypes")
 
 ```{r}
 ids <- readLines("karyotyped_samples.txt")
-ids=grep("HGC",ids,value=T, invert = T)
+# ids=grep("HGC",ids,value=T, invert = T)
 ids=grep("_r",ids,value=T, invert = T)
 ids=grep("_K",ids,value=T, invert = T)
 
-mrcas <- c("MDA-MB-231_RPMI_A12_VT2_seed", 
-           "SNU-668_C_A4_seed",
-           "SNU-668_RevC_A3_seed",
-           "SUM-159_NLS_2N_MRCA_harvest",
-           "SUM-159_NLS_4N_MRCA_harvest")
+mrcas <- c("HGC-27_MRCA_harvest", "MDA-MB-231_MRCA_harvest", "SNU-668_MRCA_harvest", "SUM-159_NLS_2N_MRCA_harvest", "SUM-159_NLS_4N_MRCA_harvest" )
+# mrcas <- c("MDA-MB-231_RPMI_A12_VT2_seed", 
+#            "SNU-668_C_A4_seed",
+#            "SNU-668_RevC_A3_seed",
+#            "SUM-159_NLS_2N_MRCA_harvest",
+#            "SUM-159_NLS_4N_MRCA_harvest")
 
 ids = setdiff(ids,mrcas)
 ```
@@ -157,7 +158,9 @@ fit_objects <- lapply(names(grouped_map), function(cond_name) {
   
   KT_list <- KT_list[!sapply(KT_list, is.null)]
   if(length(KT_list) == 0) return(NULL)
-  
+  print(names(KT_list))
+  print("**")
+  print(sapply(group, function(x) x$id_end))
   #Assign the actual replicate names to the list before merging
   names(KT_list) <- sapply(group, function(x) x$id_end)
   
