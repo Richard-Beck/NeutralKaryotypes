@@ -166,22 +166,28 @@ resolve_passage_media <- function(passage_ids, samples_tbl) {
 # Output: `media_tbl` with an added `condition` column.
 annotate_media_conditions <- function(media_tbl) {
   filters <- list(
-    !is.na(media_tbl$EnergySource2) & media_tbl$EnergySource2_pct < 100,
-    media_tbl$oxygen_pct < 20.5,
-    media_tbl$EnergySource == "L_glutamine" &
+    phosphate = !is.na(media_tbl$EnergySource2) &
+      media_tbl$EnergySource2 == "Phosphates" &
+      media_tbl$EnergySource2_pct < 100 &
+      !is.na(media_tbl$EnergySource2_pct),
+    oxygen = media_tbl$oxygen_pct < 20.5 &
+      !is.na(media_tbl$oxygen_pct),
+    glutamine = !is.na(media_tbl$EnergySource) &
+      media_tbl$EnergySource == "L_glutamine" &
       media_tbl$EnergySource_nM < 2000000 &
       !is.na(media_tbl$EnergySource_nM),
-    media_tbl$EnergySource == "Glucose" &
-      media_tbl$EnergySource_nM < 1110150 &
+    glucose = !is.na(media_tbl$EnergySource) &
+      media_tbl$EnergySource == "Glucose" &
+      media_tbl$EnergySource_nM < 11101500 &
       !is.na(media_tbl$EnergySource_nM)
   )
   filters <- do.call(cbind, filters)
 
   media_tbl$condition <- apply(filters, 1, function(row_flags) {
-    if (sum(row_flags) == 0L) {
+    if (!any(row_flags)) {
       return("control")
     }
-    deprivations <- c("phosphate", "oxygen", "glutamine", "glucose")[row_flags]
+    deprivations <- names(row_flags)[row_flags]
     paste(deprivations, collapse = "_")
   })
 
