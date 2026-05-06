@@ -1,326 +1,368 @@
 ---
-title: "testing"
+title: "Neutral Karyotype Workflow"
 output: html_document
-date: "2025-08-18"
+date: "2026-03-13"
 ---
 
+This document is the current end-to-end analysis path for the repository. It starts from cached core inputs, reconstructs connected passage trees for the karyotyped samples, converts those trees into simulation intervals, loads grouped neutral-model fits from disk, and then inspects a cached forward-simulation check.
+
+The workflow is organized so that the narrative lives here, reusable logic lives under `R/`, and the expensive computational steps are run through standalone scripts under `scripts/`. The intent is that this file stays readable as an analysis document while the heavy computations become explicit cached artifacts.
+
+This branch is maintained as a local-running variant. Local laptop runs should use smaller forward-validation settings for smoke checks and model-development loops, then reserve larger settings for production runs. The script defaults are still the reference settings unless a run explicitly documents its reduced resource profile.
+
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = "/Users/4470246/Repositories/NeutralKaryotypes")
+repo_root <- Sys.getenv("NEUTRAL_KARYOTYPES_ROOT", unset = getwd())
+knitr::opts_knit$set(root.dir = normalizePath(repo_root, mustWork = TRUE))
 ```
 
+```{r libraries}
+library(DBI)
+library(RMariaDB)
+library(ggplot2)
 
-```{r}
-ids <- readLines("karyotyped_samples.txt")
-# ids=grep("HGC",ids,value=T, invert = T)
-ids=grep("_r",ids,value=T, invert = T)
-ids=grep("_K",ids,value=T, invert = T)
-
-mrcas <- c("HGC-27_MRCA_harvest", "MDA-MB-231_MRCA_harvest", "SNU-668_MRCA_harvest", "SUM-159_NLS_2N_MRCA_harvest", "SUM-159_NLS_4N_MRCA_harvest" )
-# mrcas <- c("MDA-MB-231_RPMI_A12_VT2_seed", 
-#            "SNU-668_C_A4_seed",
-#            "SNU-668_RevC_A3_seed",
-#            "SUM-159_NLS_2N_MRCA_harvest",
-#            "SUM-159_NLS_4N_MRCA_harvest")
-
-ids = setdiff(ids,mrcas)
-```
-
-```{r}
-require(DBI)
-require(RMariaDB)
 source("R/db_utils.R")
-dbvars <- load_db_vars("db_creds.txt")
-db <- dbConnect(
+source("R/estimate_pmis.R")
+source("R/plot_utils.R")
+source("R/workflow_utils.R")
+source("scripts/fit_group_markov.R")
+source("scripts/run_forward_validation.R")
+
+dir.create("core_data", recursive = TRUE, showWarnings = FALSE)
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+dir.create("result_summaries", recursive = TRUE, showWarnings = FALSE)
+
+cache_paths <- list(
+  db_col = "core_data/db_col.Rds",
+  media = "core_data/media_raw.Rds",
+  karyotypes = "core_data/karyotypes.Rds",
+  simulation_intervals = "core_data/simulation_intervals.Rds",
+  grouped_intervals = "core_data/grouped_intervals.Rds",
+  group_fit = "results/group_fit_df.Rds"
+)
+
+sanitize_id <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+```
+
+## 1. Load and cache the core inputs
+
+The first stage reads the passaging and media tables, collapses the raw sample-level passaging records to passage-level ancestry, and caches the result in `core_data/`. To keep this document lightweight, the database is only queried if the cached files do not already exist.
+
+```{r load-data}
+karyotyped_ids <- unique(readLines("core_data/karyotyped_samples.txt"))
+
+need_db_fetch <- !file.exists(cache_paths$db_col) || !file.exists(cache_paths$media)
+if (need_db_fetch) {
+  dbvars <- load_db_vars("db_creds.txt")
+  db <- dbConnect(
     MariaDB(),
     host = dbvars["HOST"],
     user = dbvars["USER"],
     password = dbvars["PASSWORD"],
     dbname = dbvars["DBNAME"]
+  )
+
+  passaging_raw <- dbGetQuery(db, "SELECT * FROM Passaging")
+  media_raw <- dbGetQuery(db, "SELECT * FROM Media")
+  dbDisconnect(db)
+
+  db_col <- collapse_db(passaging_raw)
+  saveRDS(db_col, cache_paths$db_col)
+  saveRDS(media_raw, cache_paths$media)
+} else {
+  db_col <- readRDS(cache_paths$db_col)
+  media_raw <- readRDS(cache_paths$media)
+}
+
+if (!file.exists(cache_paths$karyotypes)) {
+  karyotypes <- get_karyotyping(karyotyped_ids)
+  saveRDS(karyotypes, cache_paths$karyotypes)
+}
+
+karyotypes <- readRDS(cache_paths$karyotypes)
+db_col <- readRDS(cache_paths$db_col)
+media_raw <- readRDS(cache_paths$media)
+```
+
+## 2. Build connected passage trees
+
+Each karyotyped sample is mapped onto the collapsed passage graph. Samples are then grouped into connected components, and each component is trimmed back to the most recent common ancestor of the sampled passages. That trimming matters because it avoids carrying unrelated upstream ancestry into the interval construction and tree plots.
+
+```{r connected-trees}
+tree_build <- build_connected_trees(db_col, karyotyped_ids)
+sample_map <- tree_build$sample_map
+connected_trees <- tree_build$connected_trees
+component_summary <- tree_build$component_summary
+
+print(sample_map)
+print(component_summary)
+
+if (any(component_summary$trimmed_pre_mrca)) {
+  message(
+    "Trimmed pre-MRCA ancestry from ",
+    sum(component_summary$trimmed_pre_mrca),
+    " connected tree(s)."
+  )
+  print(component_summary[component_summary$trimmed_pre_mrca, c(
+    "component", "component_root_id", "mrca_id", "mrca_depth",
+    "n_sampled_passages", "n_tree_passages"
+  )])
+}
+```
+
+## 3. Attach media-derived conditions
+
+The media annotations are messy enough that they still need a small amount of manual logic. For now, each passage is assigned the most common `media_id` among its associated samples, and that media record is translated into a coarse condition label. This is good enough for grouping intervals, but it should still be treated as a pragmatic approximation rather than a polished ontology.
+
+```{r annotate-conditions}
+condition_build <- assign_conditions_to_trees(
+  connected_trees = connected_trees,
+  db_samples = db_col$samples,
+  media_tbl = media_raw
 )
 
-x <- dbGetQuery(db, "SELECT * FROM Passaging")
-m <- dbGetQuery(db,"SELECT * FROM Media")
+connected_trees <- condition_build$connected_trees
+passage_media <- condition_build$passage_media
+media_col <- condition_build$media_col
 
+head(passage_media)
+head(media_col)
 ```
 
-```{r}
+## 4. Plot the connected trees
 
-find_all_ancestors <- function(id,g){
-  ids <- c()
-    while(!is.na(id)){
-      ids <- c(id,ids)
-      id <- g$passaged_from_id1[g$id==id]
-    }
-  return(ids)
-}
+These plots are a structural check before fitting. Ordinary passages are colored by assigned condition, while karyotyped passages are highlighted in red so it is easy to see which parts of each lineage contribute observed karyotype data.
 
-mrca_an <- lapply(mrcas,find_all_ancestors,g=x)
-id_an <- lapply(ids,find_all_ancestors,g=x)
-
-## which mrca belongs to each id?
-## Map each endpoint to the closest proxy MRCA based on the deepest shared branch point
-id_map <- lapply(id_an, function(lin1) {
-  
-  end_id <- tail(lin1, 1)
-  
-  # 1. Calculate how many ancestral nodes lin1 shares with each proxy MRCA
-  shared_path_lengths <- sapply(mrca_an, function(lin2) {
-    min_len <- min(length(lin1), length(lin2))
-    matches <- lin1[1:min_len] == lin2[1:min_len]
-    if (all(matches)) {
-      return(min_len)
-    } else {
-      return(which(!matches)[1] - 1)
-    }
-  })
-  
-  # 2. Find all proxy MRCAs that tied for the longest shared path
-  max_len <- max(shared_path_lengths)
-  tied_indices <- which(shared_path_lengths == max_len)
-  
-  # 3. If there is a topological tie, break it by string similarity
-  if (length(tied_indices) > 1) {
-    tied_mrcas <- mrcas[tied_indices]
-    
-    # Calculate Levenshtein string distance using R's built-in adist()
-    # The smallest distance = most biologically similar name 
-    # (e.g., SNU-668_RevG will mathematically pair with SNU-668_RevC)
-    dists <- as.numeric(adist(end_id, tied_mrcas))
-    
-    # Pick the index of the most similar MRCA string
-    best_tie_idx <- which.min(dists)
-    final_ix <- tied_indices[best_tie_idx]
-  } else {
-    final_ix <- tied_indices[1]
-  }
-  
-  list(
-    id_start = mrcas[final_ix], 
-    id_end = end_id
+```{r tree-plots, fig.width=10, fig.height=10}
+tree_plots <- lapply(seq_along(connected_trees), function(i) {
+  plot_passage_tree(
+    connected_trees[[i]],
+    component_name = names(connected_trees)[i]
   )
 })
+names(tree_plots) <- names(connected_trees)
 
-
+invisible(lapply(tree_plots, print))
 ```
 
-```{r}
-karyotypes <- get_karyotyping(c(mrcas,ids))
-## Exclude marker chromosome:
-karyotypes$karyotype = sapply(karyotypes$karyotype, function(x) x[1:22], simplify = F)
-## Exclude pop-average resolution @TODO: should happen upstream
-keep = sapply(karyotypes$karyotype, function(x) !any(x -round(x) != 0))
-karyotypes <- tibble::tibble(id = karyotypes$id[which(keep)], karyotype = karyotypes$karyotype[which(keep)])
-```
+## 5. Build simulation intervals and load grouped fits
 
-```{r}
-source("R/estimate_pmis.R")
+The next stage converts each connected tree into ancestor-descendant intervals that can be treated as simulation problems. Those interval objects are cached under `core_data/`, because they are the shared input to the grouped Markov fitting script and the forward-validation script.
 
-# --- Helper to merge Replicate Names ---
-get_condition_name <- function(id_string) {
-  
-  # 1. Fix known typos (Handling Point 4)
-  # Fixes the lowercase 'k' in "A18k" so it matches "A18K"
-  id_string <- gsub("A18k", "A18K", id_string)
-  
-  # 2. Strict Replicate Merging
-  # Target: Underscore + (O, Q, G, P, r, or K) + Digits + Underscore
-  # Replacement: Underscore + Letter + Underscore
-  # This EXCLUDES 'A' (Clone IDs) and 'C' (Condition IDs) so numbers aren't stripped from them.
-  gsub("_([OQGPrK])[0-9]+_", "_\\1_", id_string)
+The grouped grid fit itself is intentionally not run inside the notebook. `estimate_group_pmis_grid()` is expensive enough that it is cleaner to run it through `scripts/fit_group_markov.R` and then inspect the saved result here.
+
+```{r fit-markov-groups}
+if (!file.exists(cache_paths$simulation_intervals) || !file.exists(cache_paths$grouped_intervals)) {
+  simulation_intervals <- build_simulation_intervals(connected_trees, karyotypes)
+  grouped_intervals <- group_simulation_intervals(simulation_intervals)
+  saveRDS(simulation_intervals, cache_paths$simulation_intervals)
+  saveRDS(grouped_intervals, cache_paths$grouped_intervals)
+} else {
+  simulation_intervals <- readRDS(cache_paths$simulation_intervals)
+  grouped_intervals <- readRDS(cache_paths$grouped_intervals)
 }
 
-# --- Group IDs by Biological Condition ---
-names(id_map) <- sapply(id_map, function(x) x$id_end)
-conditions <- sapply(names(id_map), get_condition_name)
-grouped_map <- split(id_map, conditions)
+group_fit_df <- load_group_markov_results(
+  grouped_intervals_path = cache_paths$grouped_intervals,
+  output_path = cache_paths$group_fit
+)
+zero_copy_summary <- summarize_zero_copy_states(simulation_intervals)
+best_group_pmis <- select_best_group_fits(group_fit_df)
+best_by_pwgd <- select_best_group_fits_by_pwgd(group_fit_df)
 
-# --- Create Merged Fit Objects ---
-fit_objects <- lapply(names(grouped_map), function(cond_name) {
-  group <- grouped_map[[cond_name]]
-  
-  # Validation: Ensure all replicates map to the same Ancestor
-  mrcas <- unique(sapply(group, function(x) x$id_start))
-  if(length(mrcas) > 1) {
-    warning(paste("Skipping", cond_name, "- Replicates map to different MRCAs:", paste(mrcas, collapse=", ")))
+print(zero_copy_summary)
+print(best_group_pmis)
+print(best_by_pwgd)
+```
+
+## 6. Inspect fitted behavior
+
+Before moving to forward simulation, it is useful to compare the fitted Markov model to the observed endpoints in two ways. The ploidy view is quick to scan, but it is only an indirect diagnostic because the fit is done on per-chromosome marginals rather than full joint karyotypes. The marginal chromosome plots below are closer to the actual fitting target, so they are the more faithful diagnostic.
+
+```{r ploidy-diagnostics}
+ploidy_diag <- build_ploidy_diagnostics(grouped_intervals, best_by_pwgd)
+marginal_diag <- build_marginal_cn_diagnostics(
+  grouped_intervals,
+  best_by_pwgd,
+  chr_idx = 1:2
+)
+
+p_ploidy <- ggplot() +
+  geom_line(
+    data = ploidy_diag$predicted,
+    aes(x = ploidy, y = value, color = factor(pwgd), group = factor(pwgd))
+  ) +
+  geom_point(
+    data = ploidy_diag$observed,
+    aes(x = ploidy, y = value),
+    color = "black"
+  ) +
+  facet_wrap(~group_id, scales = "free_y") +
+  scale_x_continuous("mean copy number across chr1:22") +
+  scale_y_continuous("probability / relative frequency") +
+  scale_color_discrete("pwgd") +
+  ggtitle("Predicted ploidy distributions by pwgd level with observed endpoints")
+p_ploidy
+
+p_fit <- ggplot(group_fit_df, aes(x = pmis, y = negll, color = factor(pwgd))) +
+  facet_wrap(~group_id, scales = "free") +
+  geom_line() +
+  scale_x_log10()
+p_fit
+
+p_marginal <- ggplot() +
+  geom_line(
+    data = marginal_diag$predicted,
+    aes(x = copy_number, y = value, color = factor(pwgd), group = interaction(interval_id, pwgd))
+  ) +
+  geom_point(
+    data = marginal_diag$observed,
+    aes(x = copy_number, y = value),
+    color = "black"
+  ) +
+  facet_grid(chromosome ~ group_id, scales = "free_y") +
+  scale_x_continuous("copy number") +
+  scale_y_continuous("probability / relative frequency") +
+  scale_color_discrete("pwgd") +
+  ggtitle("Predicted marginal copy-number distributions for selected chromosomes")
+p_marginal
+```
+
+## 6B. Why the ploidy check can still look odd
+
+This chunk is just to illustrate why the Markov fits in the previous chunk do not necessarily line up with the observed ploidy distribution. The model is fit to marginal chromosome copy-number distributions, not to the joint whole-karyotype distribution. Once those marginal chromosome distributions are combined into a ploidy estimate, the missing chromosome-to-chromosome correlations can visibly matter.
+
+```{r markov-chain-example}
+i <- 7
+example_group_id <- best_group_pmis$group_id[i]
+example_interval <- grouped_intervals[[example_group_id]][[1]]
+P <- predict_marginal_cn_probs(
+  K0 = example_interval$start_karyotype,
+  n_div = example_interval$n_divisions,
+  pmis = best_group_pmis$pmis[i],
+  pwgd = best_group_pmis$pwgd[i]
+)
+
+xmpl <- data.frame(
+  chr1 = sample(rownames(P), 1000, replace = TRUE, prob = P[, 1]),
+  chr2 = sample(rownames(P), 1000, replace = TRUE, prob = P[, 2])
+)
+xmpl$chr1 <- as.numeric(as.character(xmpl$chr1))
+xmpl$chr2 <- as.numeric(as.character(xmpl$chr2))
+xmpl$ploidy <- rowMeans(xmpl[, c("chr1", "chr2")])
+xmpl$id <- seq_len(nrow(xmpl))
+xmpl <- reshape2::melt(xmpl, id.vars = "id")
+
+p_markov_example <- ggplot(xmpl, aes(x = value, color = variable, fill = variable, group = variable)) +
+  geom_density(alpha = 0.2)
+p_markov_example
+```
+
+## 7. Tentative forward-simulation check
+
+The final stage is still provisional. The forward simulator now follows the same broad assumptions as the fitted Markov model, but the reporting around these simulations is not yet finalized and this section should be treated as an exploratory validation pass rather than a settled endpoint analysis.
+
+The forward simulations are run through `scripts/run_forward_validation.R`, which writes the full simulation bank to `results/` and a lightweight posterior-predictive summary to `result_summaries/`. The chunk below loads the full saved result for one selected group and plots it.
+
+For local laptop checks, run the same script with deliberately reduced settings and a separate output path. For example:
+
+```bash
+Rscript scripts/run_forward_validation.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/group_fit_df.Rds \
+  --forward_group_id=<group_id> \
+  --output_path=results/local_smoke_forward_validation_<group_id>.Rds \
+  --n_reps=3 \
+  --n_null_pairs=10 \
+  --n_cores=1 \
+  --bottleneck_size=200 \
+  --expansion_factor=8
+```
+
+These reduced settings are for workflow validation and debugging. They should not be interpreted as final posterior-predictive settings.
+
+```{r forward-validation}
+forward_group_id <- best_group_pmis$group_id[7]
+forward_result_path <- file.path(
+  "results",
+  paste0("forward_validation_", sanitize_id(forward_group_id), ".Rds")
+)
+
+forward_result <- load_forward_validation_result(
+  forward_group_id = forward_group_id,
+  grouped_intervals_path = cache_paths$grouped_intervals,
+  group_fit_path = cache_paths$group_fit,
+  output_path = forward_result_path,
+  bottleneck_size = 1000L,
+  expansion_factor = 32L,
+  n_reps = 30L,
+  record_every = 50L,
+  n_null_pairs = 100L,
+  n_cores = 4L
+)
+forward_validation <- forward_result$forward_validation
+
+print(forward_validation$replicate_summary)
+print(forward_validation$interval_summary)
+
+p_forward <- ggplot(
+  forward_validation$ploidy,
+  aes(x = ploidy, color = type, fill = type, group = rep_idx)
+) +
+  geom_density(alpha = 0.2) +
+  facet_wrap(~interval_idx, scales = "free_y") +
+  scale_x_continuous("mean copy number across chr1:22") +
+  ggtitle(paste("Forward simulation ploidy check:", forward_group_id))
+p_forward
+
+p_forward_dist <- ggplot(
+  forward_validation$distance_plot,
+  aes(x = distance, color = comparison, fill = comparison)
+) +
+  geom_density(alpha = 0.2) +
+  facet_wrap(~interval_idx, scales = "free_y") +
+  scale_x_continuous("Wasserstein distance") +
+  ggtitle(paste("Posterior-predictive Wasserstein check:", forward_group_id))
+p_forward_dist
+```
+
+## 8. Forward-validation summary table
+
+This final chunk collects all cached forward-validation summaries currently available under `result_summaries/` and prints the interval-level posterior-predictive p-values in one table. It is only a cache summary, so it does not run any new simulations.
+
+```{r forward-validation-summary}
+forward_result_files <- list.files(
+  "result_summaries",
+  pattern = "^forward_validation_.*_summary[.]Rds$",
+  full.names = TRUE
+)
+
+forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
+  res <- readRDS(path)
+  df <- res$interval_summary
+  if (is.null(df) || !nrow(df)) {
     return(NULL)
   }
-  
-  # Get Ancestor (K0)
-  id_start <- group[[1]]$id_start
-  K0 <- do.call(rbind, karyotypes$karyotype[karyotypes$id == id_start])
-  if(is.null(K0)) return(NULL) # Safety check
-  
-  # Merge Target Karyotypes (KT)
-  KT_list <- lapply(group, function(x) {
-    if(!x$id_end %in% karyotypes$id) return(NULL)
-    do.call(rbind, karyotypes$karyotype[karyotypes$id == x$id_end])
-  })
-  
-  KT_list <- KT_list[!sapply(KT_list, is.null)]
-  if(length(KT_list) == 0) return(NULL)
-  print(names(KT_list))
-  print("**")
-  print(sapply(group, function(x) x$id_end))
-  #Assign the actual replicate names to the list before merging
-  names(KT_list) <- sapply(group, function(x) x$id_end)
-  
-  KT_merged <- do.call(rbind, KT_list)
-  HT_merged <- hist_mat_from_matrix(round(KT_merged))
-  H0 <- hist_mat_from_matrix(round(K0))
-  
-  # Calculate Time (Delta Pass)
-  pass_start <- x$passage[x$id == id_start]
-  pass_ends <- sapply(group, function(item) x$passage[x$id == item$id_end])
-  
-  if (any(is.na(pass_ends))) return(NULL)
-  delta_pass <- mean(pass_ends) - pass_start
-  
-  list(
-    id_start = id_start,
-    id_end = cond_name,       
-    replicates = names(group),
-    K0 = K0,
-    KT = KT_merged,           
-    KT_list = KT_list,        # <--- NEW: Store the unmerged matrices here
-    H0 = H0,
-    HT = HT_merged,
-    delta_pass = delta_pass
-  )
-})
+  df$forward_group_id <- res$forward_group_id
+  df$result_file <- basename(path)
+  df
+}))
 
-# Filter Nulls and Save
-fit_objects <- fit_objects[!sapply(fit_objects, is.null)]
-saveRDS(fit_objects, "fit_objects.Rds")
-
-# 
-# 
-# fit_objects <- lapply(id_map,function(id){
-#   
-#   id$K0 <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_start])
-#   if(!id$id_end%in%karyotypes$id){
-#     print(id$id_end)
-#     return(NULL)
-#   }
-#   id$KT <- do.call(rbind,karyotypes$karyotype[karyotypes$id==id$id_end])
-#   
-#   id$H0 <- hist_mat_from_matrix(round(id$K0))
-#   id$HT <- hist_mat_from_matrix(round(id$KT))
-#   
-#   id$delta_pass <- x$passage[x$id==id$id_end]-x$passage[x$id==id$id_start]
-#   id
-# })
-# fit_objects <- fit_objects[!sapply(fit_objects,is.null)]
-# saveRDS(fit_objects,"fit_objects.Rds")
+if (is.null(forward_validation_summary) || !nrow(forward_validation_summary)) {
+  message("No cached forward-validation summary files found in result_summaries/.")
+} else {
+  forward_validation_summary <- forward_validation_summary[, c(
+    "forward_group_id",
+    "interval_idx",
+    "posterior_predictive_p",
+    "test_wasserstein",
+    "null_wasserstein_median",
+    "result_file"
+  )]
+  forward_validation_summary <- forward_validation_summary[
+    order(forward_validation_summary$forward_group_id, forward_validation_summary$interval_idx),
+    ,
+    drop = FALSE
+  ]
+  print(forward_validation_summary)
+}
 ```
-
-```{r}
-# --- Execute the Local Simulation Pipeline ---
-# This runs the logic from R/run_local.R, processing all samples in fit_objects.Rds
-# It effectively replaces the Slurm submission step.
-
-message("Starting local simulation pipeline...")
-source("R/run_local.R")
-message("Simulation pipeline complete.")
-```
-
-```{r}
-# --- Collect Results and Save to CSV ---
-ff <- list.files("data/fits/", full.names = TRUE)
-
-df_list <- lapply(ff, function(fi){
-  res <- readRDS(fi)
-  if(!"test_null_res" %in% names(res)) return(NULL)
-  
-  # Get the Joint Best-Fit CIN Rate
-  best_idx <- which.min(res$resdf$negll)
-  best_cin_rate <- res$resdf$pmis[best_idx]
-  
-  # Create a row for EACH independent replicate
-  replicate_rows <- lapply(names(res$test_null_res$individuals), function(rep_name) {
-    rep_res <- res$test_null_res$individuals[[rep_name]]
-    
-    data.frame(
-      condition = res$id_end,       # e.g., SUM..._O_harvest
-      replicate_id = rep_name,      # e.g., SUM..._O1_harvest
-      ancestor = res$id_start,
-      p_value = rep_res$empp,       # Independent p-value for THIS flask
-      cin_rate = best_cin_rate,     # The joint mechanistic rate
-      delta_pass = res$delta_pass
-    )
-  })
-  
-  do.call(rbind, replicate_rows)
-})
-
-# Combine all lists, sort, and save
-df <- do.call(rbind, df_list)
-df <- df[order(df$condition),]
-data.table::fwrite(df, "data/neutral_probability.csv", sep=",")
-
-# Preview
-print(head(df))
-
-```
-
-```{r}
-x <- readRDS("data/fits/MDA-MB-231_G1_A4_seed.Rds")
-y <- readRDS("data/pops/MDA-MB-231_G1_A4_seed.Rds")
-```
-
-
-```{r}
-KT <- round(x$KT)
-image(hist_mat_from_named_counts(y[[1]]))
-image(x$H0)
-image(x$HT)
-pop <- y[1:50]
-
-library(transport)
-  
-  sampleToInt <- function(pp, Nsam=20) {
-    samstr <- sample(names(pp), size = Nsam, prob = pp)
-    samstr <- table(samstr)
-    # Ensure consistent matrix dimensions for 22 chromosomes/bins
-    coords <- matrix(as.numeric(unlist(strsplit(names(samstr), split="[.]"))), ncol=22, byrow = TRUE)
-    list(coords = coords, counts = samstr)
-  }
-  
-  Nsam <- nrow(KT)
-  
-  # Process Target (KT)
-  samstr <- table(apply(KT, 1, paste, collapse="."))
-  smm <- list(
-    coords = matrix(as.numeric(unlist(strsplit(names(samstr), split="[.]"))), ncol=22, byrow = TRUE),
-    counts = samstr
-  )
-  wtst <- wpp(smm$coords, mass = smm$counts)
-  
-  # 1. Internal distances (Null distribution)
-  dnull <- sapply(1:length(pop), function(i) {
-    sapply(1:length(pop), function(j) {
-      if (i >= j) return(NaN)
-      
-      popi <- sampleToInt(pop[[i]], Nsam)
-      popj <- sampleToInt(pop[[j]], Nsam)
-      
-      wi <- wpp(popi$coords, mass = popi$counts)
-      wj <- wpp(popj$coords, mass = popj$counts)
-      
-      wasserstein(wi, wj)
-    })
-  })
-  dnull <- dnull[is.finite(dnull)]
-  
-  # 2. Test distances (Populations vs Target)
-  dtst <- sapply(1:length(pop), function(j) {
-    popj <- sampleToInt(pop[[j]], Nsam)
-    
-    wj <- wpp(popj$coords, mass = popj$counts)
-    wasserstein(wj, wtst)
-  })
-  
-  tst_stat <- median(dtst)
-  empp <- mean(dnull > tst_stat)
-
-```
-

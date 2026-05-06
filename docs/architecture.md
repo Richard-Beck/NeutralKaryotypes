@@ -2,93 +2,125 @@
 
 ## Purpose
 
-NeutralKaryotypes estimates whether observed karyotype changes across passaged cell-line samples are consistent with a neutral chromosome mis-segregation model. The pipeline estimates a per-chromosome mis-segregation probability, generates simulated endpoint populations under that fitted rate, and compares simulated and observed karyotype distributions with Wasserstein distances.
+NeutralKaryotypes fits and checks a neutral model of karyotype evolution. The current pipeline estimates grouped chromosome mis-segregation (`p_mis`/`pmis`) and whole-genome-doubling (`p_wgd`/`pwgd`) parameters from observed endpoint karyotypes, then compares fitted behavior to forward simulations using posterior-predictive Wasserstein checks.
+
+This branch is a local-running variant. Its purpose is to keep the workflow usable on a laptop with limited cores and memory while still incorporating structural improvements from `main`.
 
 ## Canonical Workflow
 
-The current workflow appears to be `updated_workflow.Rmd`; `workflow.Rmd` appears to be older exploratory analysis. This should be treated as a question if the distinction matters for a change.
+`updated_workflow.Rmd` is the current analysis document. It is intended to stay readable and mostly orchestration-focused. Reusable logic lives under `R/`, and expensive stages are run through scripts under `scripts/` with cached outputs.
 
 The high-level flow is:
 
-1. Read karyotyped sample IDs from `karyotyped_samples.txt`.
-2. Query CLONEID-style MariaDB tables through `R/db_utils.R`, using `db_creds.txt`.
-3. Map each endpoint sample to a proxy MRCA/ancestor by passaging ancestry.
-4. Fetch karyotype vectors, drop the marker chromosome, and keep integer-resolved 22-chromosome karyotypes.
-5. Merge technical or biological replicates into condition-level fit objects.
-6. Save `fit_objects.Rds`.
-7. Run `R/run_local.R` locally or `R/analyse_lineage.R` through `fit_jobs.sub` on SLURM.
-8. Save completed fit summaries in `data/fits/` and simulated null populations in `data/pops/`.
-9. Collect per-replicate neutrality p-values into `data/neutral_probability.csv`.
-10. Optionally generate plot bundles with `make_neutrality_plots_schema_flexible.py`.
+1. Load cached karyotyped sample IDs from `core_data/karyotyped_samples.txt`.
+2. Load or build collapsed passaging data and media annotations in `core_data/`.
+3. Build connected passage trees for karyotyped samples.
+4. Assign coarse media-derived conditions to passages.
+5. Build simulation intervals and grouped intervals.
+6. Load or run grouped Markov grid fitting.
+7. Inspect ploidy and marginal copy-number diagnostics.
+8. Run or load forward-validation results.
+9. Summarize cached posterior-predictive checks from `result_summaries/`.
 
 ## Core Data Objects
 
-- `karyotypes.Rds`: List with observed karyotype vectors and passaging metadata used by the older workflow.
-- `karyotypes_mod.Rds`: Modified karyotype/passaging object from exploratory lineage work.
-- `fit_objects.Rds`: Main batch input for simulations. Each entry usually contains:
-  - `id_start`: ancestor/MRCA sample ID.
-  - `id_end`: merged endpoint or condition ID.
-  - `replicates`: endpoint IDs grouped into this condition.
-  - `K0`: ancestor cell-by-22 karyotype matrix.
-  - `KT`: merged endpoint cell-by-22 karyotype matrix.
-  - `KT_list`: per-replicate endpoint matrices.
-  - `H0`, `HT`: copy-number histograms with rows for states `0:8` and columns for 22 chromosomes.
-  - `delta_pass`: passage difference used to derive simulated time.
-- `data/fits/*.Rds`: Completed fit object with likelihood grid `resdf` and `test_null_res`.
-- `data/pops/*.Rds`: Lists of simulated endpoint population histograms, keyed by dot-separated karyotype strings.
-- `data/neutral_probability.csv`: Flat results table with condition, replicate ID, ancestor, p-value, fitted CIN rate, and passage delta.
+- `core_data/karyotyped_samples.txt`: sample IDs used as the observed karyotype set.
+- `core_data/karyotypes.Rds`: cached endpoint karyotype vectors.
+- `core_data/db_col.Rds`: collapsed passage-level ancestry graph.
+- `core_data/media_raw.Rds`: cached media table for condition annotation.
+- `core_data/simulation_intervals.Rds`: ancestor-descendant intervals derived from connected trees and karyotypes.
+- `core_data/grouped_intervals.Rds`: grouped interval object used by Markov fitting and forward validation.
+- `results/group_fit_df.Rds`: grouped grid-search output from `scripts/fit_group_markov.R`.
+- `results/forward_validation_<group>.Rds`: full forward-validation result for one group.
+- `result_summaries/forward_validation_<group>_summary.Rds`: compact sidecar summary for reporting.
+
+Older branch artifacts such as root-level `fit_objects.Rds`, `karyotypes.Rds`, `karyotypes_mod.Rds`, `data/fits/`, and `data/pops/` are not the current merged workflow path unless a maintainer explicitly restores them for a branch-specific reason.
 
 ## Main Modules
 
-- `ksim2.cpp`: Current Rcpp simulator. It stores a fixed-size population array, runs stochastic cell divisions, applies balanced chromosome mis-segregation, removes invalid daughters, culls at population caps, and records named karyotype-count histograms.
-- `R/estimate_pmis.R`: R helper layer for compiling `ksim2.cpp`, converting between matrices and histograms, generating synthetic starting populations, computing negative log likelihoods, and returning simulated endpoint populations.
-- `R/run_local.R`: Processes all entries in `fit_objects.Rds`. It estimates `pmis`, generates null populations, computes Wasserstein tests for merged and individual endpoints, and writes outputs.
-- `R/analyse_lineage.R`: Similar one-index runner intended for SLURM array execution.
-- `R/db_utils.R`: Database credential loading, karyotype extraction, and lineage helper functions.
-- `make_neutrality_plots_schema_flexible.py`: Report/plot generator from `data/neutral_probability.csv`.
+- `updated_workflow.Rmd`: current end-to-end analysis notebook.
+- `R/db_utils.R`: database loading, passaging collapse, and karyotype extraction helpers.
+- `R/estimate_pmis.R`: Markov fitting, simulator bridge, and forward-simulation helpers.
+- `R/plot_utils.R`: passage-tree plotting helpers.
+- `R/workflow_utils.R`: connected-tree construction, interval grouping, diagnostics, and validation summaries.
+- `ksim2.cpp`: Rcpp simulation engine compiled from R.
+- `scripts/fit_group_markov.R`: grouped Markov grid fitting.
+- `scripts/run_forward_validation.R`: forward validation for one group.
+- `scripts/run_forward_validation_all.R`: forward validation for every best-fit group.
 
 ## Expected Commands
 
+Grouped Markov fitting:
+
 ```bash
-# Run all pending fit objects locally.
-Rscript R/run_local.R
-
-# Run a single fit object by index with a chosen core count.
-Rscript R/analyse_lineage.R 1 16
-
-# Submit the configured HPC array.
-sbatch fit_jobs.sub
-
-# Generate plots from collected p-values, once Python dependencies exist.
-python3 make_neutrality_plots_schema_flexible.py --csv data/neutral_probability.csv --out_dir neutrality_plots_out --bundle_zip neutrality_plots_bundle.zip
+Rscript scripts/fit_group_markov.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --output_path=results/group_fit_df.Rds
 ```
 
-`Rcpp::sourceCpp("ksim2.cpp")` is called from `R/estimate_pmis.R`, so simulator compilation happens as a side effect of sourcing that file.
+Forward validation for one group:
+
+```bash
+Rscript scripts/run_forward_validation.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/group_fit_df.Rds \
+  --forward_group_id=<group_id> \
+  --output_path=results/forward_validation_<group_id>.Rds \
+  --n_reps=30 \
+  --n_null_pairs=100 \
+  --n_cores=4
+```
+
+Local laptop smoke check:
+
+```bash
+Rscript scripts/run_forward_validation.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/group_fit_df.Rds \
+  --forward_group_id=<group_id> \
+  --output_path=results/local_smoke_forward_validation_<group_id>.Rds \
+  --n_reps=3 \
+  --n_null_pairs=10 \
+  --n_cores=1 \
+  --bottleneck_size=200 \
+  --expansion_factor=8
+```
+
+Forward validation for all groups:
+
+```bash
+Rscript scripts/run_forward_validation_all.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/group_fit_df.Rds \
+  --output_dir=results \
+  --summary_output_dir=result_summaries \
+  --n_reps=30 \
+  --n_null_pairs=100 \
+  --n_cores=4
+```
 
 ## Known Fragile Areas
 
-- `R/estimate_pmis.R` defines `get_pop(p_mis, K0, nsteps, ...)` but passes `n_steps` into `run_karyotype_neutral()`. This looks like a naming bug because callers pass `nsteps = n_steps` and rely on a global `n_steps`.
-- `updated_workflow.Rmd` hard-codes a local absolute `root.dir`.
-- `db_utils.R` exists both at repo root and under `R/`; the canonical copy is not documented.
-- SQL query construction in `R/db_utils.R` interpolates IDs into a string.
-- `fit_jobs.sub` declares a fixed SLURM array range that may not match the number of fit objects.
-- There is no automated test suite or schema validation for RDS objects.
-- The current Python plotting script depends on `pandas` and `matplotlib`; these may not be present in a bare environment.
+- The local-running branch can drift from `main`; syncs should preserve laptop execution without silently changing scientific defaults.
+- Forward validation is still a model-checking layer, not a settled final statistical endpoint.
+- Ploidy diagnostics are secondary because grouped fitting targets marginal chromosome copy-number distributions, not full joint karyotypes.
+- Generated `.Rds` files can be large and scientifically meaningful; do not regenerate or commit them casually.
+- There is no formal automated test suite for simulator invariants, data schemas, connected-tree construction, or posterior-predictive summaries.
+- Database-backed cache regeneration depends on `db_creds.txt`, which must remain untracked.
 
 ## Assumptions Not To Change Silently
 
-- Karyotypes are represented as 22 chromosomes after marker-chromosome exclusion.
-- Copy-number states are modeled as integers `0:8`.
-- Simulation time is derived as `delta_pass * 5` doublings, then converted through `log(2)` growth time with `dt = 0.1`.
-- The simulator uses `rate = 1.0` in the R helper functions.
-- Population caps, `cull_keep = 1/(2^5)`, number of null replicates, likelihood grid spacing, and `record_every` affect scientific outputs.
-- `p_misseg`, `pmis`, and `cin_rate` are treated as the same fitted per-chromosome mis-segregation probability in current outputs.
+- Karyotypes are modeled across chromosomes 1:22 after marker-chromosome exclusion.
+- Copy-number state bounds are part of the model implementation.
+- `pmis`/`p_mis` and `pwgd`/`p_wgd` grid definitions affect scientific conclusions.
+- Forward-validation settings such as bottleneck size, expansion factor, replicate count, null pair count, core count, and recording frequency affect runtime and output interpretation.
+- Reduced local settings are for smoke checks and debugging unless explicitly promoted by a maintainer.
+- Wasserstein distance is the current posterior-predictive comparison metric.
 
 ## Open Questions
 
-- Is `updated_workflow.Rmd` officially canonical, or should `workflow.Rmd` remain the primary documented workflow?
-- Should `ksim.cpp` be kept as a historical simulator, a comparison implementation, or removed in a later cleanup?
-- Should generated `data/` outputs be reproducible artifacts outside git, or committed result snapshots?
-- Should database credentials eventually move from `db_creds.txt` to environment variables or a standard config file?
-- What null replicate count is expected for final results: local `100`, SLURM `150`, or another value?
+- Should local-running resource settings become a named preset or wrapper script instead of examples in documentation?
+- Which generated outputs, if any, should be tracked on this local-running branch?
+- Should this branch keep a local-only runner, or should all local runs use the `scripts/` entry points from `main`?
+- Which model should be treated as the primary reference when the marginal Markov approximation and whole-cell forward simulator disagree?
 
