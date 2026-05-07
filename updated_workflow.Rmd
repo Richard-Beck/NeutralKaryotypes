@@ -254,6 +254,137 @@ p_markov_example <- ggplot(xmpl, aes(x = value, color = variable, fill = variabl
 p_markov_example
 ```
 
+## 6C. Marginal neutrality tests from the fitted Markov model
+
+Because the fitted model targets per-chromosome marginals, a natural lightweight neutrality check is a posterior-predictive test on those same marginals. For each interval and chromosome, the chunk below compares the observed endpoint copy-number distribution to repeated multinomial draws from the fitted marginal distribution. This gives a chromosome-level misfit score and posterior-predictive p-value without needing the full forward simulator.
+
+```{r marginal-neutrality-tests}
+set.seed(1)
+
+states <- 0:8
+n_marginal_pp_reps <- 500L
+
+marginal_pp_test <- function(obs_counts, pred_prob, n_reps = 500L) {
+  obs_counts <- as.numeric(obs_counts)
+  pred_prob <- as.numeric(pred_prob)
+  pred_prob <- pred_prob / sum(pred_prob)
+  n_obs <- sum(obs_counts)
+  obs_prob <- obs_counts / n_obs
+
+  observed_tv <- 0.5 * sum(abs(obs_prob - pred_prob))
+  observed_w1 <- sum(abs(cumsum(obs_prob) - cumsum(pred_prob)))
+  observed_nll <- -sum(obs_counts * log(pmax(pred_prob, 1e-12)))
+
+  sim_counts <- rmultinom(n = n_reps, size = n_obs, prob = pred_prob)
+  sim_prob <- sweep(sim_counts, 2, colSums(sim_counts), "/", check.margin = FALSE)
+
+  null_tv <- apply(sim_prob, 2, function(p) 0.5 * sum(abs(p - pred_prob)))
+  null_w1 <- apply(sim_prob, 2, function(p) sum(abs(cumsum(p) - cumsum(pred_prob))))
+  null_nll <- apply(sim_counts, 2, function(cnt) -sum(cnt * log(pmax(pred_prob, 1e-12))))
+
+  list(
+    observed_tv = observed_tv,
+    observed_w1 = observed_w1,
+    observed_nll = observed_nll,
+    null_tv_median = median(null_tv, na.rm = TRUE),
+    null_tv_q25 = unname(stats::quantile(null_tv, probs = 0.25, na.rm = TRUE)),
+    null_tv_q75 = unname(stats::quantile(null_tv, probs = 0.75, na.rm = TRUE)),
+    pp_p_tv = mean(null_tv >= observed_tv, na.rm = TRUE),
+    pp_p_w1 = mean(null_w1 >= observed_w1, na.rm = TRUE),
+    pp_p_nll = mean(null_nll >= observed_nll, na.rm = TRUE)
+  )
+}
+
+marginal_neutrality <- do.call(rbind, lapply(seq_len(nrow(best_group_pmis)), function(i) {
+  group_id <- best_group_pmis$group_id[i]
+  fit_row <- best_group_pmis[i, ]
+  group_intervals <- grouped_intervals[[group_id]]
+
+  do.call(rbind, lapply(seq_along(group_intervals), function(interval_idx) {
+    interval <- group_intervals[[interval_idx]]
+    P_pred <- predict_marginal_cn_probs(
+      K0 = interval$start_karyotype,
+      n_div = interval$n_divisions,
+      pmis = fit_row$pmis,
+      pwgd = fit_row$pwgd,
+      states = states
+    )
+    KT <- round(as.matrix(interval$end_karyotype))
+
+    do.call(rbind, lapply(seq_len(ncol(KT)), function(chr) {
+      obs_counts <- table(factor(KT[, chr], levels = states))
+      test <- marginal_pp_test(
+        obs_counts = obs_counts,
+        pred_prob = P_pred[, chr],
+        n_reps = n_marginal_pp_reps
+      )
+
+      data.frame(
+        group_id = group_id,
+        interval_idx = interval_idx,
+        condition = interval$condition,
+        chromosome = paste0("chr", chr),
+        n_cells = nrow(KT),
+        observed_tv = test$observed_tv,
+        null_tv_median = test$null_tv_median,
+        null_tv_q25 = test$null_tv_q25,
+        null_tv_q75 = test$null_tv_q75,
+        scaled_tv_excess = (test$observed_tv - test$null_tv_median) /
+          pmax(test$null_tv_q75 - test$null_tv_q25, 1e-8),
+        pp_p_tv = test$pp_p_tv,
+        pp_p_w1 = test$pp_p_w1,
+        pp_p_nll = test$pp_p_nll,
+        stringsAsFactors = FALSE
+      )
+    }))
+  }))
+}))
+
+group_chr_neutrality <- aggregate(
+  cbind(observed_tv, null_tv_median, scaled_tv_excess, pp_p_tv) ~ group_id + chromosome,
+  data = marginal_neutrality,
+  FUN = median
+)
+
+group_chr_neutrality$neglog10_pp_p_tv <- -log10(pmax(group_chr_neutrality$pp_p_tv, 1e-6))
+
+p_group_chr_neutrality <- ggplot(
+  group_chr_neutrality,
+  aes(x = chromosome, y = group_id, fill = scaled_tv_excess)
+) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "grey95",
+    mid = "khaki1",
+    high = "firebrick",
+    midpoint = 0,
+    name = "Scaled TV excess"
+  ) +
+  xlab("Chromosome") +
+  ylab("Group") +
+  ggtitle("Chromosome-level marginal neutrality departures by group")
+
+p_group_chr_neutrality
+
+p_group_chr_pval <- ggplot(
+  group_chr_neutrality,
+  aes(x = chromosome, y = group_id, fill = neglog10_pp_p_tv)
+) +
+  geom_tile() +
+  scale_fill_gradient(
+    low = "grey95",
+    high = "steelblue4",
+    name = "-log10 median pp p"
+  ) +
+  xlab("Chromosome") +
+  ylab("Group") +
+  ggtitle("Chromosome-level marginal posterior-predictive p-values by group")
+
+p_group_chr_pval
+
+group_chr_neutrality[order(group_chr_neutrality$scaled_tv_excess, decreasing = TRUE), ]
+```
+
 ## 7. Tentative forward-simulation check
 
 The final stage is still provisional. The forward simulator now follows the same broad assumptions as the fitted Markov model, but the reporting around these simulations is not yet finalized and this section should be treated as an exploratory validation pass rather than a settled endpoint analysis.
@@ -261,7 +392,7 @@ The final stage is still provisional. The forward simulator now follows the same
 The forward simulations are run through `scripts/run_forward_validation.R`, which writes the full simulation bank to `results/` and a lightweight posterior-predictive summary to `result_summaries/`. The chunk below loads the full saved result for one selected group and plots it.
 
 ```{r forward-validation}
-forward_group_id <- best_group_pmis$group_id[7]
+forward_group_id <- best_group_pmis$group_id[2]
 forward_result_path <- file.path(
   "results",
   paste0("forward_validation_", sanitize_id(forward_group_id), ".Rds")
@@ -311,38 +442,175 @@ This final chunk collects all cached forward-validation summaries currently avai
 
 ```{r forward-validation-summary}
 forward_result_files <- list.files(
-  "result_summaries",
-  pattern = "^forward_validation_.*_summary[.]Rds$",
-  full.names = TRUE
-)
+    "result_summaries",
+    pattern = "^forward_validation_.*_summary[.]Rds$",
+    full.names = TRUE
+  )
 
-forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
-  res <- readRDS(path)
-  df <- res$interval_summary
-  if (is.null(df) || !nrow(df)) {
-    return(NULL)
+  forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
+    res <- readRDS(path)
+    df <- res$interval_summary
+    if (is.null(df) || !nrow(df)) {
+      return(NULL)
+    }
+    df$forward_group_id <- res$forward_group_id
+    df$result_file <- basename(path)
+    df
+  }))
+
+  if (is.null(forward_validation_summary) || !nrow(forward_validation_summary)) {
+    message("No cached forward-validation summary files found in result_summaries/.")
+  } else {
+    forward_validation_summary$null_iqr <-
+      forward_validation_summary$null_wasserstein_q75 -
+      forward_validation_summary$null_wasserstein_q25
+
+    forward_validation_summary$excess_wasserstein <-
+      forward_validation_summary$test_wasserstein -
+      forward_validation_summary$null_wasserstein_median
+
+    forward_validation_summary$scaled_excess <-
+      forward_validation_summary$excess_wasserstein /
+      pmax(forward_validation_summary$null_iqr, 1e-8)
+
+    forward_validation_summary$lineage_interval <- paste(
+      forward_validation_summary$forward_group_id,
+      paste0("int", forward_validation_summary$interval_idx),
+      sep = " | "
+    )
+
+    forward_validation_summary <- forward_validation_summary[
+      order(forward_validation_summary$scaled_excess, decreasing = TRUE),
+      ,
+      drop = FALSE
+    ]
+    forward_validation_summary$lineage_interval <- factor(
+      forward_validation_summary$lineage_interval,
+      levels = rev(unique(forward_validation_summary$lineage_interval))
+    )
+
+    p_abnormal <- ggplot(
+      forward_validation_summary,
+      aes(x = scaled_excess, y = lineage_interval, color = posterior_predictive_p)
+    ) +
+      geom_vline(xintercept = 0, linetype = 2, color = "grey60") +
+      geom_point(size = 3) +
+      scale_color_gradient(
+        low = "firebrick",
+        high = "steelblue",
+        trans = "reverse",
+        name = "posterior_predictive_p"
+      ) +
+      xlab("Excess Wasserstein over null median (scaled by null IQR)") +
+      ylab("Lineage interval") +
+      ggtitle("How abnormal is each lineage interval under the neutral model?")
+
+    print(p_abnormal)
+
+    p_raw <- ggplot(
+      forward_validation_summary,
+      aes(
+        x = null_wasserstein_median,
+        y = test_wasserstein,
+        label = interval_idx,
+        color = posterior_predictive_p
+      )
+    ) +
+      geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+      geom_point(size = 3) +
+      facet_wrap(~forward_group_id, scales = "free") +
+      scale_color_gradient(
+        low = "firebrick",
+        high = "steelblue",
+        trans = "reverse",
+        name = "posterior_predictive_p"
+      ) +
+      xlab("Null median Wasserstein") +
+      ylab("Observed vs simulated Wasserstein") +
+      ggtitle("Observed misfit versus neutral null expectation")
+
+    print(p_raw)
+
+    print(
+      forward_validation_summary[, c(
+        "forward_group_id",
+        "interval_idx",
+        "posterior_predictive_p",
+        "test_wasserstein",
+        "null_wasserstein_median",
+        "scaled_excess"
+      )]
+    )
   }
-  df$forward_group_id <- res$forward_group_id
-  df$result_file <- basename(path)
-  df
-}))
-
-if (is.null(forward_validation_summary) || !nrow(forward_validation_summary)) {
-  message("No cached forward-validation summary files found in result_summaries/.")
-} else {
-  forward_validation_summary <- forward_validation_summary[, c(
-    "forward_group_id",
-    "interval_idx",
-    "posterior_predictive_p",
-    "test_wasserstein",
-    "null_wasserstein_median",
-    "result_file"
-  )]
-  forward_validation_summary <- forward_validation_summary[
-    order(forward_validation_summary$forward_group_id, forward_validation_summary$interval_idx),
-    ,
-    drop = FALSE
-  ]
-  print(forward_validation_summary)
-}
 ```
+
+```{r}
+ ## Chromosome-level marginal neutrality screen
+
+  states <- 0:8
+  best_group_pmis <- select_best_group_fits(group_fit_df)
+
+  chr_misfit <- do.call(rbind, lapply(seq_len(nrow(best_group_pmis)), function(i) {
+    group_id <- best_group_pmis$group_id[i]
+    fit_row <- best_group_pmis[i, ]
+    group_intervals <- grouped_intervals[[group_id]]
+
+    do.call(rbind, lapply(seq_along(group_intervals), function(interval_idx) {
+      interval <- group_intervals[[interval_idx]]
+
+      P_pred <- predict_marginal_cn_probs(
+        K0 = interval$start_karyotype,
+        n_div = interval$n_divisions,
+        pmis = fit_row$pmis,
+        pwgd = fit_row$pwgd,
+        states = states
+      )
+
+      KT <- round(as.matrix(interval$end_karyotype))
+
+      do.call(rbind, lapply(seq_len(ncol(KT)), function(chr) {
+        obs_counts <- table(factor(KT[, chr], levels = states))
+        obs_prob <- as.numeric(obs_counts) / sum(obs_counts)
+        pred_prob <- P_pred[, chr]
+
+        tv <- 0.5 * sum(abs(obs_prob - pred_prob))
+        wass1 <- sum(abs(cumsum(obs_prob) - cumsum(pred_prob)))
+        nll <- -sum(obs_counts * log(pmax(pred_prob, 1e-12)))
+
+        data.frame(
+          group_id = group_id,
+          interval_idx = interval_idx,
+          condition = interval$condition,
+          chromosome = paste0("chr", chr),
+          n_cells = nrow(KT),
+          tv = tv,
+          wasserstein1 = wass1,
+          negloglik = nll,
+          stringsAsFactors = FALSE
+        )
+      }))
+    }))
+  }))
+
+  chr_summary <- aggregate(
+    cbind(tv, wasserstein1, negloglik) ~ chromosome,
+    data = chr_misfit,
+    FUN = median
+  )
+
+  chr_summary <- chr_summary[order(chr_summary$tv, decreasing = TRUE), ]
+  print(chr_summary)
+
+  p_chr_tv <- ggplot(
+    chr_summary,
+    aes(x = reorder(chromosome, tv), y = tv)
+  ) +
+    geom_col(fill = "firebrick") +
+    coord_flip() +
+    xlab("Chromosome") +
+    ylab("Median marginal total variation distance") +
+    ggtitle("Which chromosomes look least neutral under the fitted Markov model?")
+
+  p_chr_tv
+```
+
