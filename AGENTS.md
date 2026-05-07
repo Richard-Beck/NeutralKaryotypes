@@ -31,6 +31,8 @@ Rscript scripts/run_forward_validation.R --grouped_intervals_path=core_data/grou
 Rscript scripts/run_forward_validation_all.R --grouped_intervals_path=core_data/grouped_intervals.Rds --group_fit_path=results/group_fit_df.Rds --output_dir=results --summary_output_dir=result_summaries --n_reps=30 --n_null_pairs=100 --n_cores=4
 ```
 
+Forward validation defaults to `--distance_metric=chrom_weighted_wasserstein`; use `--distance_metric=wasserstein` to reproduce the older unweighted endpoint-distance check.
+
 For local laptop smoke checks, reduce settings explicitly, for example `--n_reps=3 --n_null_pairs=10 --n_cores=1 --bottleneck_size=200 --expansion_factor=8`. Run the R Markdown workflow manually in RStudio or another R Markdown environment. There is no formal test, lint, build, or package manifest yet.
 
 ## Dependencies

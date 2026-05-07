@@ -274,6 +274,7 @@ Rscript scripts/run_forward_validation.R \
   --n_reps=3 \
   --n_null_pairs=10 \
   --n_cores=1 \
+  --distance_metric=chrom_weighted_wasserstein \
   --bottleneck_size=200 \
   --expansion_factor=8
 ```
@@ -281,7 +282,7 @@ Rscript scripts/run_forward_validation.R \
 These reduced settings are for workflow validation and debugging. They should not be interpreted as final posterior-predictive settings.
 
 ```{r forward-validation}
-forward_group_id <- best_group_pmis$group_id[7]
+forward_group_id <- best_group_pmis$group_id[14]
 forward_result_path <- file.path(
   "results",
   paste0("forward_validation_", sanitize_id(forward_group_id), ".Rds")
@@ -297,9 +298,15 @@ forward_result <- load_forward_validation_result(
   n_reps = 30L,
   record_every = 50L,
   n_null_pairs = 100L,
-  n_cores = 4L
+  n_cores = 4L,
+  distance_metric = "chrom_weighted_wasserstein"
 )
 forward_validation <- forward_result$forward_validation
+forward_distance_label <- if (identical(forward_result$settings$distance_metric, "chrom_weighted_wasserstein")) {
+  "Chromosome-weighted Wasserstein distance"
+} else {
+  "Wasserstein distance"
+}
 
 print(forward_validation$replicate_summary)
 print(forward_validation$interval_summary)
@@ -320,8 +327,8 @@ p_forward_dist <- ggplot(
 ) +
   geom_density(alpha = 0.2) +
   facet_wrap(~interval_idx, scales = "free_y") +
-  scale_x_continuous("Wasserstein distance") +
-  ggtitle(paste("Posterior-predictive Wasserstein check:", forward_group_id))
+  scale_x_continuous(forward_distance_label) +
+  ggtitle(paste("Posterior-predictive endpoint-distance check:", forward_group_id))
 p_forward_dist
 ```
 

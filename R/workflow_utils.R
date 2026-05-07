@@ -409,14 +409,54 @@ sample_simulated_endpoint <- function(simulated_matrix, target_n, seed = NULL) {
   simulated_matrix[idx, , drop = FALSE]
 }
 
+chromosome_lengths_bp <- c(
+  chr1 = 248956422,
+  chr2 = 242193529,
+  chr3 = 198295559,
+  chr4 = 190214555,
+  chr5 = 181538259,
+  chr6 = 170805979,
+  chr7 = 159345973,
+  chr8 = 145138636,
+  chr9 = 138394717,
+  chr10 = 133797422,
+  chr11 = 135086622,
+  chr12 = 133275309,
+  chr13 = 114364328,
+  chr14 = 107043718,
+  chr15 = 101991189,
+  chr16 = 90338345,
+  chr17 = 83257441,
+  chr18 = 80373285,
+  chr19 = 58617616,
+  chr20 = 64444167,
+  chr21 = 46709983,
+  chr22 = 50818468
+)
+
+chromosome_distance_weights <- function(sample_matrix) {
+  chr_names <- colnames(sample_matrix)
+  if (is.null(chr_names) || !all(chr_names %in% names(chromosome_lengths_bp))) {
+    chr_names <- paste0("chr", seq_len(ncol(sample_matrix)))
+  }
+  weights <- chromosome_lengths_bp[chr_names]
+  if (any(is.na(weights))) {
+    stop("Missing chromosome lengths for: ", paste(chr_names[is.na(weights)], collapse = ", "))
+  }
+  weights / sum(weights)
+}
+
 # Compute Wasserstein distance between two endpoint karyotype samples.
 # Inputs: `sample_a` and `sample_b` cell-by-chromosome matrices.
 # Output: scalar Wasserstein distance.
-endpoint_wasserstein <- function(sample_a, sample_b) {
+endpoint_wasserstein <- function(sample_a,
+                                 sample_b,
+                                 distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
   if (!requireNamespace("transport", quietly = TRUE)) {
     stop("endpoint_wasserstein() requires the 'transport' package.")
   }
 
+  distance_metric <- match.arg(distance_metric)
   sample_a <- round(as.matrix(sample_a))
   sample_b <- round(as.matrix(sample_b))
   if (!nrow(sample_a) || !nrow(sample_b)) {
@@ -424,6 +464,10 @@ endpoint_wasserstein <- function(sample_a, sample_b) {
   }
   if (ncol(sample_a) != ncol(sample_b)) {
     stop("Endpoint samples must have the same number of columns.")
+  }
+  coord_scale <- rep(1, ncol(sample_a))
+  if (identical(distance_metric, "chrom_weighted_wasserstein")) {
+    coord_scale <- sqrt(chromosome_distance_weights(sample_a))
   }
 
   make_wpp <- function(M) {
@@ -433,6 +477,7 @@ endpoint_wasserstein <- function(sample_a, sample_b) {
       ncol = ncol(M),
       byrow = TRUE
     )
+    coords <- sweep(coords, 2, coord_scale, `*`)
     mass <- as.numeric(samstr)
     mass <- mass / sum(mass)
     transport::wpp(coords, mass = mass)
@@ -447,7 +492,9 @@ endpoint_wasserstein <- function(sample_a, sample_b) {
 posterior_predictive_endpoint_check <- function(observed_matrix,
                                                 simulated_matrices,
                                                 n_pairs = 100,
-                                                seed = 1) {
+                                                seed = 1,
+                                                distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+  distance_metric <- match.arg(distance_metric)
   observed_matrix <- round(as.matrix(observed_matrix))
   simulated_matrices <- Filter(function(M) nrow(as.matrix(M)) > 0, simulated_matrices)
   n_observed <- nrow(observed_matrix)
@@ -464,7 +511,8 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
         null_median = NA_real_,
         null_q25 = NA_real_,
         null_q75 = NA_real_,
-        posterior_predictive_p = NA_real_
+        posterior_predictive_p = NA_real_,
+        distance_metric = distance_metric
       ),
       ploidy = numeric()
     ))
@@ -479,7 +527,7 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
   })
 
   observed_distances <- vapply(sampled_sims, function(sim_sample) {
-    endpoint_wasserstein(observed_matrix, sim_sample)
+    endpoint_wasserstein(observed_matrix, sim_sample, distance_metric = distance_metric)
   }, numeric(1))
   test_statistic <- median(observed_distances, na.rm = TRUE)
 
@@ -491,7 +539,8 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
   null_distances <- vapply(seq_len(ncol(pair_idx)), function(k) {
     endpoint_wasserstein(
       sampled_sims[[pair_idx[1, k]]],
-      sampled_sims[[pair_idx[2, k]]]
+      sampled_sims[[pair_idx[2, k]]],
+      distance_metric = distance_metric
     )
   }, numeric(1))
 
@@ -506,7 +555,8 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
       null_median = median(null_distances, na.rm = TRUE),
       null_q25 = unname(stats::quantile(null_distances, probs = 0.25, na.rm = TRUE)),
       null_q75 = unname(stats::quantile(null_distances, probs = 0.75, na.rm = TRUE)),
-      posterior_predictive_p = mean(null_distances >= test_statistic, na.rm = TRUE)
+      posterior_predictive_p = mean(null_distances >= test_statistic, na.rm = TRUE),
+      distance_metric = distance_metric
     ),
     sampled_sims = sampled_sims
   )
@@ -519,14 +569,17 @@ summarize_forward_validation <- function(forward_runs,
                                          group_intervals,
                                          group_id,
                                          n_null_pairs = 100,
-                                         seed_base = 10000) {
+                                         seed_base = 10000,
+                                         distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+  distance_metric <- match.arg(distance_metric)
   interval_checks <- lapply(seq_along(forward_runs), function(interval_idx) {
     sim_matrices <- lapply(forward_runs[[interval_idx]], `[[`, "final_matrix")
     posterior_predictive_endpoint_check(
       observed_matrix = group_intervals[[interval_idx]]$end_karyotype,
       simulated_matrices = sim_matrices,
       n_pairs = n_null_pairs,
-      seed = seed_base + interval_idx * 100
+      seed = seed_base + interval_idx * 100,
+      distance_metric = distance_metric
     )
   })
 
@@ -554,6 +607,7 @@ summarize_forward_validation <- function(forward_runs,
       null_wasserstein_median = check$summary$null_median,
       null_wasserstein_q75 = check$summary$null_q75,
       posterior_predictive_p = check$summary$posterior_predictive_p,
+      distance_metric = check$summary$distance_metric,
       stringsAsFactors = FALSE
     )
   }))
@@ -561,7 +615,7 @@ summarize_forward_validation <- function(forward_runs,
   interval_summary <- forward_summary[, c(
     "group_id", "interval_idx", "n_observed_cells", "n_simulations", "n_compared_cells",
     "test_wasserstein", "null_wasserstein_q25", "null_wasserstein_median",
-    "null_wasserstein_q75", "posterior_predictive_p"
+    "null_wasserstein_q75", "posterior_predictive_p", "distance_metric"
   )]
 
   simulated_ploidy <- do.call(rbind, lapply(seq_along(interval_checks), function(interval_idx) {
@@ -598,12 +652,14 @@ summarize_forward_validation <- function(forward_runs,
         interval_idx = interval_idx,
         distance = check$observed_distances,
         comparison = "observed_vs_simulated",
+        distance_metric = check$summary$distance_metric,
         stringsAsFactors = FALSE
       ),
       data.frame(
         interval_idx = interval_idx,
         distance = check$null_distances,
         comparison = "simulated_vs_simulated",
+        distance_metric = check$summary$distance_metric,
         stringsAsFactors = FALSE
       )
     )
@@ -628,7 +684,7 @@ write_neutral_probability_csv <- function(summary_dir = "result_summaries",
   out_cols <- c(
     "condition", "replicate_id", "ancestor", "p_value", "cin_rate", "delta_pass",
     "p_wgd", "fit_negll", "interval_idx", "test_wasserstein",
-    "null_wasserstein_median", "result_file"
+    "null_wasserstein_median", "distance_metric", "result_file"
   )
 
   forward_result_files <- list.files(summary_dir, pattern = summary_pattern, full.names = TRUE)
@@ -652,6 +708,13 @@ write_neutral_probability_csv <- function(summary_dir = "result_summaries",
     df <- res$interval_summary
     if (is.null(df) || !nrow(df)) {
       return(NULL)
+    }
+    if (is.null(df$distance_metric)) {
+      df$distance_metric <- if (!is.null(res$settings$distance_metric)) {
+        res$settings$distance_metric
+      } else {
+        "wasserstein"
+      }
     }
 
     df$forward_group_id <- res$forward_group_id

@@ -25,7 +25,9 @@ run_forward_validation_all_main <- function(grouped_intervals_path = "core_data/
                                             record_every = 50L,
                                             n_null_pairs = 100L,
                                             n_cores = default_forward_n_cores(),
-                                            seed = 1L) {
+                                            seed = 1L,
+                                            distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+  distance_metric <- match.arg(distance_metric)
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(summary_output_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -54,7 +56,8 @@ run_forward_validation_all_main <- function(grouped_intervals_path = "core_data/
       record_every = record_every,
       n_null_pairs = n_null_pairs,
       n_cores = n_cores,
-      seed = seed + 1000L * i
+      seed = seed + 1000L * i,
+      distance_metric = distance_metric
     )
     result_paths[i] <- output_path
   }
@@ -80,7 +83,13 @@ if (sys.nframe() == 0L) {
     optparse::make_option("--record_every", type = "integer", default = 50L),
     optparse::make_option("--n_null_pairs", type = "integer", default = 100L),
     optparse::make_option("--n_cores", type = "integer", default = default_forward_n_cores()),
-    optparse::make_option("--seed", type = "integer", default = 1L)
+    optparse::make_option("--seed", type = "integer", default = 1L),
+    optparse::make_option(
+      "--distance_metric",
+      type = "character",
+      default = "chrom_weighted_wasserstein",
+      help = "Posterior-predictive endpoint distance: chrom_weighted_wasserstein or wasserstein."
+    )
   )
   opt <- optparse::parse_args(optparse::OptionParser(option_list = option_list))
 
@@ -95,6 +104,7 @@ if (sys.nframe() == 0L) {
     record_every = opt$record_every,
     n_null_pairs = opt$n_null_pairs,
     n_cores = opt$n_cores,
-    seed = opt$seed
+    seed = opt$seed,
+    distance_metric = opt$distance_metric
   )
 }

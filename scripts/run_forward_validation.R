@@ -112,10 +112,12 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
                                         record_every = 50L,
                                         n_null_pairs = 100L,
                                         n_cores = default_forward_n_cores(),
-                                        seed = 1L) {
+                                        seed = 1L,
+                                        distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("run_forward_validation_main() requires a non-empty `forward_group_id`.")
   }
+  distance_metric <- match.arg(distance_metric)
 
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
   dir.create(dirname(summary_output_path), recursive = TRUE, showWarnings = FALSE)
@@ -148,7 +150,8 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     group_intervals = grouped_intervals[[forward_group_id]],
     group_id = forward_group_id,
     n_null_pairs = as.integer(n_null_pairs),
-    seed_base = as.integer(seed) * 10000L
+    seed_base = as.integer(seed) * 10000L,
+    distance_metric = distance_metric
   )
 
   out <- list(
@@ -161,7 +164,8 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
       record_every = as.integer(record_every),
       n_null_pairs = as.integer(n_null_pairs),
       n_cores = as.integer(n_cores),
-      seed = as.integer(seed)
+      seed = as.integer(seed),
+      distance_metric = distance_metric
     ),
     forward_runs = forward_runs,
     forward_validation = forward_validation
@@ -171,11 +175,18 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
   saveRDS(forward_validation_summary_object(out), summary_output_path)
   message("Saved forward validation to ", output_path)
   message("Saved forward validation summary to ", summary_output_path)
-  write_neutral_probability_csv(
-    summary_dir = dirname(summary_output_path),
-    grouped_intervals_path = grouped_intervals_path,
-    output_path = "data/neutral_probability.csv"
-  )
+  if (identical(
+    normalizePath(dirname(summary_output_path), mustWork = FALSE),
+    normalizePath("result_summaries", mustWork = FALSE)
+  )) {
+    write_neutral_probability_csv(
+      summary_dir = dirname(summary_output_path),
+      grouped_intervals_path = grouped_intervals_path,
+      output_path = "data/neutral_probability.csv"
+    )
+  } else {
+    message("Skipped aggregate neutral_probability.csv update for non-default summary directory: ", dirname(summary_output_path))
+  }
   out
 }
 
@@ -193,15 +204,28 @@ load_forward_validation_result <- function(forward_group_id,
                                            record_every = 50L,
                                            n_null_pairs = 100L,
                                            n_cores = default_forward_n_cores(),
-                                           seed = 1L) {
+                                           seed = 1L,
+                                           distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("load_forward_validation_result() requires a non-empty `forward_group_id`.")
   }
   if (missing(output_path) || !nzchar(output_path)) {
     stop("load_forward_validation_result() requires `output_path`.")
   }
+  distance_metric <- match.arg(distance_metric)
 
-  if (!file.exists(output_path)) {
+  needs_refresh <- !file.exists(output_path)
+  if (!needs_refresh) {
+    cached_result <- readRDS(output_path)
+    cached_metric <- if (!is.null(cached_result$settings$distance_metric)) {
+      cached_result$settings$distance_metric
+    } else {
+      "wasserstein"
+    }
+    needs_refresh <- !identical(cached_metric, distance_metric)
+  }
+
+  if (needs_refresh) {
     run_forward_validation_main(
       grouped_intervals_path = grouped_intervals_path,
       group_fit_path = group_fit_path,
@@ -214,7 +238,8 @@ load_forward_validation_result <- function(forward_group_id,
       record_every = record_every,
       n_null_pairs = n_null_pairs,
       n_cores = n_cores,
-      seed = seed
+      seed = seed,
+      distance_metric = distance_metric
     )
   }
 
@@ -234,7 +259,13 @@ if (sys.nframe() == 0L) {
     optparse::make_option("--record_every", type = "integer", default = 50L),
     optparse::make_option("--n_null_pairs", type = "integer", default = 100L),
     optparse::make_option("--n_cores", type = "integer", default = default_forward_n_cores()),
-    optparse::make_option("--seed", type = "integer", default = 1L)
+    optparse::make_option("--seed", type = "integer", default = 1L),
+    optparse::make_option(
+      "--distance_metric",
+      type = "character",
+      default = "chrom_weighted_wasserstein",
+      help = "Posterior-predictive endpoint distance: chrom_weighted_wasserstein or wasserstein."
+    )
   )
   opt <- optparse::parse_args(optparse::OptionParser(option_list = option_list))
 
@@ -259,6 +290,7 @@ if (sys.nframe() == 0L) {
     record_every = opt$record_every,
     n_null_pairs = opt$n_null_pairs,
     n_cores = opt$n_cores,
-    seed = opt$seed
+    seed = opt$seed,
+    distance_metric = opt$distance_metric
   )
 }
