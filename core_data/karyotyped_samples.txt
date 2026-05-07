@@ -18,7 +18,7 @@ SNU-668_P2_A18k_seed
 SNU-668_P1_A18K_seed
 SNU-668_P0_A11K_seed
 MDA-MB-231_RPMI_A12_VT2_seed
-SNU-668_C_A4_seed
+SNU-668_MRCA_harvest
 SNU-668_C_A24_seed
 HGC-27_P2_A18K_harvest
 HGC-27_P1_A18K_harvest
@@ -32,6 +32,5 @@ SNU-668_G2_A10_seed
 SNU-668_G1_A10_seed
 HGC-27_MRCA_harvest
 MDA-MB-231_MRCA_harvest
-SNU-668_MRCA_harvest
 SUM-159_NLS_4N_MRCA_harvest
 SUM-159_NLS_2N_MRCA_harvest
