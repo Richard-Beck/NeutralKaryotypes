@@ -349,6 +349,8 @@ extract_karyotyped_intervals <- function(tree) {
 # Output: scalar character condition label.
 resolve_interval_condition <- function(condition_counts) {
   condition_names <- names(condition_counts)
+  condition_names[condition_names == "phosphate_glutamine"] <- "phosphate"
+  condition_names <- unique(condition_names)
   if (!length(condition_names)) {
     return("unknown")
   }

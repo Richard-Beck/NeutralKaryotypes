@@ -8,8 +8,11 @@ This document is the current end-to-end analysis path for the repository. It sta
 
 The workflow is organized so that the narrative lives here, reusable logic lives under `R/`, and the expensive computational steps are run through standalone scripts under `scripts/`. The intent is that this file stays readable as an analysis document while the heavy computations become explicit cached artifacts.
 
+This branch is maintained as a local-running variant. Local laptop runs should use smaller forward-validation settings for smoke checks and model-development loops, then reserve larger settings for production runs. The script defaults are still the reference settings unless a run explicitly documents its reduced resource profile.
+
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = "~/projects/021_ltee_models/NeutralKaryotypes/")
+repo_root <- Sys.getenv("NEUTRAL_KARYOTYPES_ROOT", unset = getwd())
+knitr::opts_knit$set(root.dir = normalizePath(repo_root, mustWork = TRUE))
 ```
 
 ```{r libraries}
@@ -260,6 +263,23 @@ The final stage is still provisional. The forward simulator now follows the same
 
 The forward simulations are run through `scripts/run_forward_validation.R`, which writes the full simulation bank to `results/` and a lightweight posterior-predictive summary to `result_summaries/`. The chunk below loads the full saved result for one selected group and plots it.
 
+For local laptop checks, run the same script with deliberately reduced settings and a separate output path. For example:
+
+```bash
+Rscript scripts/run_forward_validation.R \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/group_fit_df.Rds \
+  --forward_group_id=<group_id> \
+  --output_path=results/local_smoke_forward_validation_<group_id>.Rds \
+  --n_reps=3 \
+  --n_null_pairs=10 \
+  --n_cores=1 \
+  --bottleneck_size=200 \
+  --expansion_factor=8
+```
+
+These reduced settings are for workflow validation and debugging. They should not be interpreted as final posterior-predictive settings.
+
 ```{r forward-validation}
 forward_group_id <- best_group_pmis$group_id[7]
 forward_result_path <- file.path(
@@ -307,42 +327,13 @@ p_forward_dist
 
 ## 8. Forward-validation summary table
 
-This final chunk collects all cached forward-validation summaries currently available under `result_summaries/` and prints the interval-level posterior-predictive p-values in one table. It is only a cache summary, so it does not run any new simulations.
+This final chunk collects all cached forward-validation summaries currently available under `result_summaries/`, prints the interval-level posterior-predictive p-values in one table, and writes a backward-compatible aggregate CSV to `data/neutral_probability.csv`. It is only a cache summary, so it does not run any new simulations.
 
 ```{r forward-validation-summary}
-forward_result_files <- list.files(
-  "result_summaries",
-  pattern = "^forward_validation_.*_summary[.]Rds$",
-  full.names = TRUE
+neutral_probability <- write_neutral_probability_csv(
+  summary_dir = "result_summaries",
+  grouped_intervals_path = cache_paths$grouped_intervals,
+  output_path = "data/neutral_probability.csv"
 )
-
-forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
-  res <- readRDS(path)
-  df <- res$interval_summary
-  if (is.null(df) || !nrow(df)) {
-    return(NULL)
-  }
-  df$forward_group_id <- res$forward_group_id
-  df$result_file <- basename(path)
-  df
-}))
-
-if (is.null(forward_validation_summary) || !nrow(forward_validation_summary)) {
-  message("No cached forward-validation summary files found in result_summaries/.")
-} else {
-  forward_validation_summary <- forward_validation_summary[, c(
-    "forward_group_id",
-    "interval_idx",
-    "posterior_predictive_p",
-    "test_wasserstein",
-    "null_wasserstein_median",
-    "result_file"
-  )]
-  forward_validation_summary <- forward_validation_summary[
-    order(forward_validation_summary$forward_group_id, forward_validation_summary$interval_idx),
-    ,
-    drop = FALSE
-  ]
-  print(forward_validation_summary)
-}
+print(neutral_probability)
 ```

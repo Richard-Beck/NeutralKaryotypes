@@ -166,22 +166,28 @@ resolve_passage_media <- function(passage_ids, samples_tbl) {
 # Output: `media_tbl` with an added `condition` column.
 annotate_media_conditions <- function(media_tbl) {
   filters <- list(
-    !is.na(media_tbl$EnergySource2) & media_tbl$EnergySource2_pct < 100,
-    media_tbl$oxygen_pct < 20.5,
-    media_tbl$EnergySource == "L_glutamine" &
+    phosphate = !is.na(media_tbl$EnergySource2) &
+      media_tbl$EnergySource2 == "Phosphates" &
+      media_tbl$EnergySource2_pct < 100 &
+      !is.na(media_tbl$EnergySource2_pct),
+    oxygen = media_tbl$oxygen_pct < 20.5 &
+      !is.na(media_tbl$oxygen_pct),
+    glutamine = !is.na(media_tbl$EnergySource) &
+      media_tbl$EnergySource == "L_glutamine" &
       media_tbl$EnergySource_nM < 2000000 &
       !is.na(media_tbl$EnergySource_nM),
-    media_tbl$EnergySource == "Glucose" &
-      media_tbl$EnergySource_nM < 1110150 &
+    glucose = !is.na(media_tbl$EnergySource) &
+      media_tbl$EnergySource == "Glucose" &
+      media_tbl$EnergySource_nM < 11101500 &
       !is.na(media_tbl$EnergySource_nM)
   )
   filters <- do.call(cbind, filters)
 
   media_tbl$condition <- apply(filters, 1, function(row_flags) {
-    if (sum(row_flags) == 0L) {
+    if (!any(row_flags)) {
       return("control")
     }
-    deprivations <- c("phosphate", "oxygen", "glutamine", "glucose")[row_flags]
+    deprivations <- names(row_flags)[row_flags]
     paste(deprivations, collapse = "_")
   })
 
@@ -610,4 +616,87 @@ summarize_forward_validation <- function(forward_runs,
     distance_plot = distance_plot_df,
     interval_checks = interval_checks
   )
+}
+
+# Aggregate cached forward-validation summaries into a flat neutrality results table.
+# Inputs: summary directory/path pattern, grouped intervals, and output CSV path.
+# Output: data.frame written to `output_path`, compatible with the old neutral_probability.csv columns.
+write_neutral_probability_csv <- function(summary_dir = "result_summaries",
+                                          grouped_intervals_path = "core_data/grouped_intervals.Rds",
+                                          output_path = "data/neutral_probability.csv",
+                                          summary_pattern = "^forward_validation_.*_summary[.]Rds$") {
+  out_cols <- c(
+    "condition", "replicate_id", "ancestor", "p_value", "cin_rate", "delta_pass",
+    "p_wgd", "fit_negll", "interval_idx", "test_wasserstein",
+    "null_wasserstein_median", "result_file"
+  )
+
+  forward_result_files <- list.files(summary_dir, pattern = summary_pattern, full.names = TRUE)
+  grouped_intervals <- if (file.exists(grouped_intervals_path)) {
+    readRDS(grouped_intervals_path)
+  } else {
+    list()
+  }
+
+  if (!length(forward_result_files)) {
+    out <- data.frame(matrix(ncol = length(out_cols), nrow = 0))
+    names(out) <- out_cols
+    dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+    utils::write.csv(out, output_path, row.names = FALSE)
+    message("No cached forward-validation summaries found; wrote empty ", output_path)
+    return(out)
+  }
+
+  forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
+    res <- readRDS(path)
+    df <- res$interval_summary
+    if (is.null(df) || !nrow(df)) {
+      return(NULL)
+    }
+
+    df$forward_group_id <- res$forward_group_id
+    df$result_file <- basename(path)
+    if (!is.null(res$fit_row) && nrow(res$fit_row)) {
+      df$cin_rate <- res$fit_row$pmis[1]
+      df$p_wgd <- res$fit_row$pwgd[1]
+      df$fit_negll <- res$fit_row$negll[1]
+    } else {
+      df$cin_rate <- NA_real_
+      df$p_wgd <- NA_real_
+      df$fit_negll <- NA_real_
+    }
+
+    if (res$forward_group_id %in% names(grouped_intervals)) {
+      interval_meta <- grouped_intervals[[res$forward_group_id]]
+      df$condition <- res$forward_group_id
+      df$replicate_id <- vapply(df$interval_idx, function(i) interval_meta[[i]]$end, character(1))
+      df$ancestor <- vapply(df$interval_idx, function(i) interval_meta[[i]]$start, character(1))
+      df$delta_pass <- vapply(df$interval_idx, function(i) interval_meta[[i]]$elapsed_passages, numeric(1))
+    } else {
+      df$condition <- res$forward_group_id
+      df$replicate_id <- NA_character_
+      df$ancestor <- NA_character_
+      df$delta_pass <- NA_real_
+    }
+
+    df
+  }))
+
+  if (is.null(forward_validation_summary) || !nrow(forward_validation_summary)) {
+    out <- data.frame(matrix(ncol = length(out_cols), nrow = 0))
+    names(out) <- out_cols
+  } else {
+    forward_validation_summary$p_value <- forward_validation_summary$posterior_predictive_p
+    forward_validation_summary <- forward_validation_summary[
+      order(forward_validation_summary$forward_group_id, forward_validation_summary$interval_idx),
+      ,
+      drop = FALSE
+    ]
+    out <- forward_validation_summary[, out_cols]
+  }
+
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(out, output_path, row.names = FALSE)
+  message("Wrote ", nrow(out), " aggregate neutrality result rows to ", output_path)
+  out
 }
