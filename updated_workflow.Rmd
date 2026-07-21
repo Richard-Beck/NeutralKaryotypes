@@ -282,7 +282,7 @@ Rscript scripts/run_forward_validation.R \
 These reduced settings are for workflow validation and debugging. They should not be interpreted as final posterior-predictive settings.
 
 ```{r forward-validation}
-forward_group_id <- best_group_pmis$group_id[14]
+forward_group_id <- best_group_pmis$group_id[3]
 forward_result_path <- file.path(
   "results",
   paste0("forward_validation_", sanitize_id(forward_group_id), ".Rds")

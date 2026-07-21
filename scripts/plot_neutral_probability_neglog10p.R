@@ -11,7 +11,9 @@ parse_args <- function(args) {
     media_path = "core_data/media_raw.Rds",
     karyotyped_samples_path = "core_data/karyotyped_samples.txt",
     heatmap_subdir = "cell_line_heatmaps",
+    condition_heatmap_subdir = "condition_heatmaps",
     heatmap_enrichment_csv = "cluster_condition_enrichment.csv",
+    condition_heatmap_enrichment_csv = "cluster_condition_enrichment.csv",
     heatmap_cluster_selection_csv = "cluster_selection_summary.csv",
     heatmap_enrichment_alpha = 0.05,
     heatmap_width = 2200,
@@ -681,49 +683,103 @@ gap_statistic_score <- function(cell_mat, membership, B = 10L) {
   mean(ref_logs) - log(wk_obs)
 }
 
-evaluate_cluster_condition_enrichment <- function(cell_df,
-                                                  cluster_membership,
-                                                  condition_levels,
-                                                  alpha = 0.05,
-                                                  adjust_method = "BH") {
+evaluate_cluster_group_enrichment <- function(cell_df,
+                                              cluster_membership,
+                                              group_col,
+                                              group_levels,
+                                              output_col,
+                                              alpha = 0.05,
+                                              adjust_method = "BH") {
   total_cells <- nrow(cell_df)
   clusters <- sort(unique(as.integer(cluster_membership)))
   out <- do.call(rbind, lapply(clusters, function(cluster_id) {
     in_cluster <- cluster_membership == cluster_id
     cluster_size <- sum(in_cluster)
 
-    do.call(rbind, lapply(condition_levels, function(condition_name) {
-      is_condition <- as.character(cell_df$condition_group) == condition_name
-      a <- sum(in_cluster & is_condition)
-      b <- sum(in_cluster & !is_condition)
-      c <- sum(!in_cluster & is_condition)
-      d <- sum(!in_cluster & !is_condition)
-      expected <- cluster_size * sum(is_condition) / total_cells
+    do.call(rbind, lapply(group_levels, function(group_name) {
+      is_group <- as.character(cell_df[[group_col]]) == group_name
+      a <- sum(in_cluster & is_group)
+      b <- sum(in_cluster & !is_group)
+      c <- sum(!in_cluster & is_group)
+      d <- sum(!in_cluster & !is_group)
+      expected <- cluster_size * sum(is_group) / total_cells
       enrichment_fold <- if (expected > 0) a / expected else NA_real_
       fisher_p <- stats::fisher.test(
         matrix(c(a, b, c, d), nrow = 2),
         alternative = "greater"
       )$p.value
 
-      data.frame(
+      out_row <- data.frame(
         cluster_id = cluster_id,
-        condition = condition_name,
         n_cells_total = total_cells,
         n_cells_cluster = cluster_size,
-        n_condition_total = sum(is_condition),
-        n_condition_in_cluster = a,
+        n_group_total = sum(is_group),
+        n_group_in_cluster = a,
         expected_in_cluster = expected,
         enrichment_fold = enrichment_fold,
         p_value = fisher_p,
         stringsAsFactors = FALSE
       )
+      out_row[[output_col]] <- group_name
+      out_row
     }))
   }))
 
+  out <- out[, c(
+    "cluster_id", output_col, "n_cells_total", "n_cells_cluster",
+    "n_group_total", "n_group_in_cluster", "expected_in_cluster",
+    "enrichment_fold", "p_value"
+  )]
   out$p_adj <- stats::p.adjust(out$p_value, method = adjust_method)
   out$is_overrepresented <- with(
     out,
+    n_group_in_cluster > expected_in_cluster & p_adj <= alpha
+  )
+  out
+}
+
+evaluate_cluster_condition_enrichment <- function(cell_df,
+                                                  cluster_membership,
+                                                  condition_levels,
+                                                  alpha = 0.05,
+                                                  adjust_method = "BH") {
+  out <- evaluate_cluster_group_enrichment(
+    cell_df = cell_df,
+    cluster_membership = cluster_membership,
+    group_col = "condition_group",
+    group_levels = condition_levels,
+    output_col = "condition",
+    alpha = alpha,
+    adjust_method = adjust_method
+  )
+  names(out)[names(out) == "n_group_total"] <- "n_condition_total"
+  names(out)[names(out) == "n_group_in_cluster"] <- "n_condition_in_cluster"
+  out$is_overrepresented <- with(
+    out,
     n_condition_in_cluster > expected_in_cluster & p_adj <= alpha
+  )
+  out
+}
+
+evaluate_cluster_cell_line_enrichment <- function(cell_df,
+                                                  cluster_membership,
+                                                  cell_line_levels,
+                                                  alpha = 0.05,
+                                                  adjust_method = "BH") {
+  out <- evaluate_cluster_group_enrichment(
+    cell_df = cell_df,
+    cluster_membership = cluster_membership,
+    group_col = "cell_line",
+    group_levels = cell_line_levels,
+    output_col = "cell_line",
+    alpha = alpha,
+    adjust_method = adjust_method
+  )
+  names(out)[names(out) == "n_group_total"] <- "n_cell_line_total"
+  names(out)[names(out) == "n_group_in_cluster"] <- "n_cell_line_in_cluster"
+  out$is_overrepresented <- with(
+    out,
+    n_cell_line_in_cluster > expected_in_cluster & p_adj <= alpha
   )
   out
 }
@@ -851,20 +907,68 @@ plot_cell_line_heatmap <- function(cell_df,
                                    cluster_mode,
                                    cluster_score,
                                    k_min,
-                                   k_max) {
+                                   k_max,
+                                   heatmap_group = c("cell_line", "condition", "condition_pair")) {
   if (!nrow(cell_df)) {
     return(invisible(NULL))
   }
 
+  heatmap_group <- match.arg(heatmap_group)
   condition_levels <- condition_display_order(cell_df$condition_group)
   cell_df$condition_group <- factor(cell_df$condition_group, levels = condition_levels)
-  cell_df <- cell_df[order(
-    cell_df$condition_group,
-    cell_df$passage_rank,
-    cell_df$passage_label,
-    cell_df$sample_id,
-    cell_df$cell_index
-  ), , drop = FALSE]
+  if (identical(heatmap_group, "condition")) {
+    cell_line_levels <- ordered_unique(cell_df$cell_line[order(cell_df$cell_line)])
+    cell_df$cell_line <- factor(cell_df$cell_line, levels = cell_line_levels)
+    cell_df <- cell_df[order(
+      cell_df$cell_line,
+      cell_df$passage_rank,
+      cell_df$passage_label,
+      cell_df$sample_id,
+      cell_df$cell_index
+    ), , drop = FALSE]
+    enrichment_levels <- cell_line_levels
+    enrichment_col <- "cell_line"
+    enrichment_label <- "cell-line"
+    group_label <- unique(as.character(cell_df$condition_group))
+    if (length(group_label) != 1L) {
+      group_label <- paste(unique(as.character(cell_df$condition_group)), collapse = " / ")
+    }
+  } else if (identical(heatmap_group, "condition_pair")) {
+    cell_line_levels <- ordered_unique(cell_df$cell_line[order(cell_df$cell_line)])
+    cell_df$cell_line <- factor(cell_df$cell_line, levels = cell_line_levels)
+    cell_df <- cell_df[order(
+      cell_df$condition_group,
+      cell_df$cell_line,
+      cell_df$passage_rank,
+      cell_df$passage_label,
+      cell_df$sample_id,
+      cell_df$cell_index
+    ), , drop = FALSE]
+    enrichment_levels <- condition_levels
+    enrichment_col <- "condition"
+    enrichment_label <- "condition"
+    non_control <- setdiff(condition_levels, "Control")
+    group_label <- if (length(non_control) == 1L) {
+      paste0(non_control, " vs Control")
+    } else {
+      paste(condition_levels, collapse = " / ")
+    }
+  } else {
+    cell_df <- cell_df[order(
+      cell_df$condition_group,
+      cell_df$passage_rank,
+      cell_df$passage_label,
+      cell_df$sample_id,
+      cell_df$cell_index
+    ), , drop = FALSE]
+    enrichment_levels <- condition_levels
+    enrichment_col <- "condition"
+    enrichment_label <- "condition"
+    group_label <- unique(as.character(cell_df$cell_line))
+    if (length(group_label) != 1L) {
+      group_label <- paste(unique(as.character(cell_df$cell_line)), collapse = " / ")
+    }
+  }
 
   chr_cols <- paste0("chr", seq_len(22))
   cell_mat <- as.matrix(cell_df[, chr_cols, drop = FALSE])
@@ -888,7 +992,7 @@ plot_cell_line_heatmap <- function(cell_df,
     cell_df <- cell_df[ord, , drop = FALSE]
     cell_mat <- cell_mat[ord, , drop = FALSE]
 
-    fixed_k <- if (identical(unique(as.character(cell_df$cell_line)), "MDA-231")) 4L else 6L
+    fixed_k <- if (identical(heatmap_group, "cell_line") && identical(unique(as.character(cell_df$cell_line)), "MDA-231")) 4L else 6L
     k_choice <- select_cluster_count(
       distance_obj = d,
       hc = hc,
@@ -904,12 +1008,21 @@ plot_cell_line_heatmap <- function(cell_df,
     cluster_membership <- stats::cutree(hc, k = selected_k)[ord]
   }
 
-  enrichment_df <- evaluate_cluster_condition_enrichment(
-    cell_df = cell_df,
-    cluster_membership = cluster_membership,
-    condition_levels = condition_levels,
-    alpha = enrichment_alpha
-  )
+  enrichment_df <- if (identical(heatmap_group, "condition")) {
+    evaluate_cluster_cell_line_enrichment(
+      cell_df = cell_df,
+      cluster_membership = cluster_membership,
+      cell_line_levels = enrichment_levels,
+      alpha = enrichment_alpha
+    )
+  } else {
+    evaluate_cluster_condition_enrichment(
+      cell_df = cell_df,
+      cluster_membership = cluster_membership,
+      condition_levels = enrichment_levels,
+      alpha = enrichment_alpha
+    )
+  }
 
   heatmap_mat <- t(cell_mat)
   rownames(heatmap_mat) <- chr_cols
@@ -919,6 +1032,20 @@ plot_cell_line_heatmap <- function(cell_df,
 
   condition_palette <- grDevices::hcl.colors(max(3, length(condition_levels)), palette = "Set 2")
   condition_colors <- setNames(condition_palette[seq_along(condition_levels)], condition_levels)
+
+  cell_line_levels <- ordered_unique(as.character(cell_df$cell_line))
+  cell_line_palette <- grDevices::hcl.colors(max(3, length(cell_line_levels)), palette = "Dark 3")
+  cell_line_colors <- setNames(cell_line_palette[seq_along(cell_line_levels)], cell_line_levels)
+
+  primary_levels <- if (identical(heatmap_group, "condition")) cell_line_levels else condition_levels
+  primary_colors <- if (identical(heatmap_group, "condition")) cell_line_colors else condition_colors
+  primary_label <- if (identical(heatmap_group, "condition")) "Line" else "Cond"
+  primary_values <- if (identical(heatmap_group, "condition")) as.character(cell_df$cell_line) else as.character(cell_df$condition_group)
+  primary_legend_title <- if (identical(heatmap_group, "condition")) "Cell line" else "Condition"
+
+  secondary_levels <- if (identical(heatmap_group, "condition_pair")) cell_line_levels else character()
+  secondary_colors <- if (identical(heatmap_group, "condition_pair")) cell_line_colors else NULL
+  secondary_values <- if (identical(heatmap_group, "condition_pair")) as.character(cell_df$cell_line) else character()
 
   passage_levels <- unique(cell_df$passage_label)
   passage_palette <- grDevices::colorRampPalette(c("#8C5A2B", "#F5F1E8", "#111111"))(max(3, length(passage_levels)))
@@ -944,16 +1071,16 @@ plot_cell_line_heatmap <- function(cell_df,
     grDevices::dev.off()
   }, add = TRUE)
 
-  n_condition_rows <- length(condition_levels)
-  star_y_base <- n_rows + 1.8
+  n_condition_rows <- length(enrichment_levels)
+  star_y_base <- if (identical(heatmap_group, "condition_pair")) n_rows + 2.5 else n_rows + 1.8
   star_y_step <- 0.5
   dend_y0 <- star_y_base + n_condition_rows * star_y_step + 0.3
   dend_y1 <- dend_y0 + 2.4
 
-  par(mar = c(7, 7, 10, 19), xpd = NA)
+  par(mar = c(7, 7, 10, 30), xpd = NA)
   plot(
     NA,
-    xlim = c(0.5, n_cols + 12.5),
+    xlim = c(0.5, n_cols + 32.0),
     ylim = c(0.5, dend_y1 + 0.8),
     xaxt = "n",
     yaxt = "n",
@@ -973,43 +1100,51 @@ plot_cell_line_heatmap <- function(cell_df,
       x <- x_pos[col_idx]
       rect(x - 0.5, y - 0.5, x + 0.5, y + 0.5, col = row_colors[col_idx], border = "grey92")
     }
-    text(0.3, y, labels = rownames(heatmap_mat)[row_idx], adj = 1, cex = 0.7)
   }
 
   cond_y0 <- n_rows + 0.15
   cond_y1 <- n_rows + 0.75
-  pass_y0 <- n_rows + 0.85
-  pass_y1 <- n_rows + 1.45
+  secondary_y0 <- n_rows + 0.85
+  secondary_y1 <- n_rows + 1.45
+  pass_y0 <- if (identical(heatmap_group, "condition_pair")) n_rows + 1.55 else n_rows + 0.85
+  pass_y1 <- if (identical(heatmap_group, "condition_pair")) n_rows + 2.15 else n_rows + 1.45
 
   for (col_idx in seq_len(n_cols)) {
     x <- x_pos[col_idx]
-    cond_col <- condition_colors[[as.character(cell_df$condition_group[col_idx])]]
+    cond_col <- primary_colors[[primary_values[col_idx]]]
     pass_col <- passage_colors[[cell_df$passage_label[col_idx]]]
     rect(x - 0.5, cond_y0, x + 0.5, cond_y1, col = cond_col, border = NA)
+    if (identical(heatmap_group, "condition_pair")) {
+      line_col <- secondary_colors[[secondary_values[col_idx]]]
+      rect(x - 0.5, secondary_y0, x + 0.5, secondary_y1, col = line_col, border = NA)
+    }
     rect(x - 0.5, pass_y0, x + 0.5, pass_y1, col = pass_col, border = NA)
   }
 
   axis(side = 2, at = y_pos, labels = rownames(heatmap_mat), las = 2, cex.axis = 0.8)
   axis(side = 1, at = x_pos, labels = FALSE, tick = FALSE)
-  text(0.3, (cond_y0 + cond_y1) / 2, labels = "Cond", adj = 1, cex = 0.7, font = 2)
+  text(0.3, (cond_y0 + cond_y1) / 2, labels = primary_label, adj = 1, cex = 0.7, font = 2)
+  if (identical(heatmap_group, "condition_pair")) {
+    text(0.3, (secondary_y0 + secondary_y1) / 2, labels = "Line", adj = 1, cex = 0.7, font = 2)
+  }
   text(0.3, (pass_y0 + pass_y1) / 2, labels = "Pass", adj = 1, cex = 0.7, font = 2)
 
   sig_df <- enrichment_df[enrichment_df$is_overrepresented, , drop = FALSE]
   if (nrow(sig_df)) {
-    for (i in seq_along(condition_levels)) {
-      condition_name <- condition_levels[i]
+    for (i in seq_along(enrichment_levels)) {
+      group_name <- enrichment_levels[i]
       y_star <- star_y_base + (n_condition_rows - i) * star_y_step
       text(
         0.3,
         y_star,
-        labels = condition_name,
+        labels = group_name,
         adj = 1,
         cex = 0.62,
-        col = condition_colors[[condition_name]],
+        col = primary_colors[[group_name]],
         font = 2
       )
 
-      cond_sig <- sig_df[sig_df$condition == condition_name, , drop = FALSE]
+      cond_sig <- sig_df[as.character(sig_df[[enrichment_col]]) == group_name, , drop = FALSE]
       if (!nrow(cond_sig)) {
         next
       }
@@ -1025,7 +1160,7 @@ plot_cell_line_heatmap <- function(cell_df,
           y_star,
           labels = "*",
           cex = 1.1,
-          col = condition_colors[[condition_name]],
+          col = primary_colors[[group_name]],
           font = 2
         )
       }
@@ -1039,43 +1174,70 @@ plot_cell_line_heatmap <- function(cell_df,
   }
 
   title(
-    main = paste0(unique(cell_df$cell_line), ": cell-level karyotype heatmap"),
+    main = paste0(group_label, ": cell-level karyotype heatmap"),
     sub = paste0(
-      "Columns are observed cells clustered with ward.D using ",
+      "ward.D, ",
       if (identical(distance_mode, "chrom_weighted")) "chromosome-length-weighted" else "unweighted",
-      " distance and cut into ",
+      " distance, ",
       selected_k,
-      " clusters; rows are chromosomes; * marks cluster-condition enrichments"
+      " clusters; * marks cluster-", enrichment_label, " enrichments"
     )
   )
 
   draw_discrete_legend(
-    title = "Condition",
-    labels = condition_levels,
-    colors = condition_colors,
+    title = primary_legend_title,
+    labels = primary_levels,
+    colors = primary_colors,
     x = n_cols + 2.2,
     y_top = dend_y1 - 0.2
   )
-  draw_discrete_legend(
-    title = "Passage",
-    labels = passage_levels,
-    colors = passage_colors,
-    x = n_cols + 2.2,
-    y_top = n_rows - 2.5,
-    cex = 0.65
-  )
+  passage_legend_y <- n_rows - 2.5
+  if (identical(heatmap_group, "condition_pair")) {
+    draw_discrete_legend(
+      title = "Cell line",
+      labels = secondary_levels,
+      colors = secondary_colors,
+      x = n_cols + 2.2,
+      y_top = dend_y1 - 3.2
+    )
+  } else {
+    draw_discrete_legend(
+      title = "Passage",
+      labels = passage_levels,
+      colors = passage_colors,
+      x = n_cols + 2.2,
+      y_top = passage_legend_y,
+      cex = 0.65
+    )
+  }
   draw_continuous_legend(
     colors = fill_colors,
     zlim = zlim,
-    x = n_cols + 9.0,
+    x = n_cols + 28.0,
     y_bottom = max(1, n_rows * 0.15),
-    y_top = max(6, n_rows * 0.9)
+    y_top = max(6, n_rows * 0.42)
   )
 
-  enrichment_df$cell_line <- unique(as.character(cell_df$cell_line))
+  enrichment_df$heatmap_group <- heatmap_group
+  enrichment_df$heatmap_value <- group_label
+  if (identical(heatmap_group, "condition")) {
+    enrichment_df$condition <- group_label
+  } else if (identical(heatmap_group, "cell_line")) {
+    enrichment_df$cell_line <- group_label
+  } else {
+    enrichment_df$comparison <- group_label
+  }
   enrichment_df$distance_mode <- distance_mode
   enrichment_df$n_clusters <- selected_k
-  cluster_selection_summary$cell_line <- unique(as.character(cell_df$cell_line))
+  cluster_selection_summary$heatmap_group <- heatmap_group
+  cluster_selection_summary$heatmap_value <- group_label
+  if (identical(heatmap_group, "condition")) {
+    cluster_selection_summary$condition <- group_label
+  } else if (identical(heatmap_group, "cell_line")) {
+    cluster_selection_summary$cell_line <- group_label
+  } else {
+    cluster_selection_summary$comparison <- group_label
+  }
   cluster_selection_summary$distance_mode <- distance_mode
   cluster_selection_summary$selected_k <- selected_k
 
@@ -1101,7 +1263,9 @@ write_cell_line_heatmaps <- function(output_dir,
                                      cluster_mode,
                                      cluster_score,
                                      k_min,
-                                     k_max) {
+                                     k_max,
+                                     group_by = c("cell_line", "condition", "condition_pair")) {
+  group_by <- match.arg(group_by)
   required_paths <- c(karyotypes_path, db_col_path, media_path, karyotyped_samples_path)
   if (!all(file.exists(required_paths))) {
     missing <- required_paths[!file.exists(required_paths)]
@@ -1123,11 +1287,32 @@ write_cell_line_heatmaps <- function(output_dir,
 
   enrichment_results <- list()
   cluster_selection_results <- list()
-  for (cell_line in ordered_unique(cell_profiles$cell_line)) {
-    cell_df <- cell_profiles[cell_profiles$cell_line == cell_line, , drop = FALSE]
+  if (identical(group_by, "condition_pair")) {
+    condition_values <- condition_display_order(unique(as.character(cell_profiles$condition_group)))
+    group_values <- setdiff(condition_values, "Control")
+    group_col <- "condition_group"
+    suffix <- "condition-pair"
+  } else if (identical(group_by, "condition")) {
+    group_values <- condition_display_order(unique(as.character(cell_profiles$condition_group)))
+    group_col <- "condition_group"
+    suffix <- "condition"
+  } else {
+    group_values <- ordered_unique(cell_profiles$cell_line)
+    group_col <- "cell_line"
+    suffix <- "cell_line"
+  }
+
+  for (group_value in group_values) {
+    if (identical(group_by, "condition_pair")) {
+      cell_df <- cell_profiles[as.character(cell_profiles[[group_col]]) %in% c("Control", group_value), , drop = FALSE]
+      output_stem <- paste0(group_value, "_vs_Control")
+    } else {
+      cell_df <- cell_profiles[as.character(cell_profiles[[group_col]]) == group_value, , drop = FALSE]
+      output_stem <- group_value
+    }
     output_path <- file.path(
       output_dir,
-      paste0(gsub("[^A-Za-z0-9._-]+", "_", cell_line), "_karyotype_heatmap.png")
+      paste0(gsub("[^A-Za-z0-9._-]+", "_", output_stem), "_karyotype_heatmap.png")
     )
     heatmap_result <- plot_cell_line_heatmap(
       cell_df = cell_df,
@@ -1140,11 +1325,12 @@ write_cell_line_heatmaps <- function(output_dir,
       cluster_mode = cluster_mode,
       cluster_score = cluster_score,
       k_min = k_min,
-      k_max = k_max
+      k_max = k_max,
+      heatmap_group = group_by
     )
-    enrichment_results[[cell_line]] <- heatmap_result$enrichment
-    cluster_selection_results[[cell_line]] <- heatmap_result$cluster_selection
-    message("Saved cell-line heatmap to ", output_path)
+    enrichment_results[[group_value]] <- heatmap_result$enrichment
+    cluster_selection_results[[group_value]] <- heatmap_result$cluster_selection
+    message("Saved ", suffix, " heatmap to ", output_path)
   }
 
   enrichment_df <- do.call(rbind, enrichment_results)
@@ -1157,7 +1343,7 @@ write_cell_line_heatmaps <- function(output_dir,
       file.path(output_dir, enrichment_csv_name),
       row.names = FALSE
     )
-    message("Saved cluster-condition enrichment results to ", file.path(output_dir, enrichment_csv_name))
+    message("Saved cluster enrichment results to ", file.path(output_dir, enrichment_csv_name))
   }
 
   if (!is.null(cluster_selection_df) && nrow(cluster_selection_df)) {
@@ -1198,7 +1384,28 @@ main <- function() {
     cluster_mode = opts$heatmap_cluster_mode,
     cluster_score = opts$heatmap_cluster_score,
     k_min = opts$heatmap_k_min,
-    k_max = opts$heatmap_k_max
+    k_max = opts$heatmap_k_max,
+    group_by = "cell_line"
+  )
+  write_cell_line_heatmaps(
+    output_dir = file.path(opts$out_dir, opts$condition_heatmap_subdir),
+    karyotypes_path = opts$karyotypes_path,
+    db_col_path = opts$db_col_path,
+    media_path = opts$media_path,
+    karyotyped_samples_path = opts$karyotyped_samples_path,
+    neutral_probability_df = annotated,
+    width = opts$heatmap_width,
+    height = opts$heatmap_height,
+    res = opts$res,
+    distance_mode = opts$heatmap_distance,
+    enrichment_csv_name = opts$condition_heatmap_enrichment_csv,
+    enrichment_alpha = opts$heatmap_enrichment_alpha,
+    cluster_selection_csv_name = opts$heatmap_cluster_selection_csv,
+    cluster_mode = opts$heatmap_cluster_mode,
+    cluster_score = opts$heatmap_cluster_score,
+    k_min = opts$heatmap_k_min,
+    k_max = opts$heatmap_k_max,
+    group_by = "condition_pair"
   )
 
   message("Saved grouped -log10(p) plot to ", output_path)
