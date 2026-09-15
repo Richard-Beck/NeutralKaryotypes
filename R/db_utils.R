@@ -211,7 +211,7 @@ build_media_col <- function(samples, media_tbl) {
 # Extract ancestor-descendant intervals between karyotyped passages in one tree.
 # Input: `tree` list containing sampled passages, tree edges, and tree conditions.
 # Output: list of interval records with start/end passages and path conditions.
-extract_karyotyped_intervals <- function(tree) {
+extract_karyotyped_intervals <- function(tree, full_windows = NULL) {
   required_tree_fields <- c("sampled_passage_ids", "tree_edges", "tree_conditions")
   missing_tree_fields <- setdiff(required_tree_fields, names(tree))
   if (length(missing_tree_fields) > 0) {
@@ -334,6 +334,46 @@ extract_karyotyped_intervals <- function(tree) {
   }
 
   intervals <- c(direct_intervals, alias_intervals)
+  # Full windows are opt-in reviewed requests, never an all-pairs expansion.
+  # A proxy must name its exact native parent; its physical sample is retained.
+  if (!is.null(full_windows) && nrow(full_windows)) {
+    if (!is.data.frame(full_windows) ||
+        !all(c("start", "end", "start_alias") %in% names(full_windows))) {
+      stop("full_windows requires start, end and start_alias columns.")
+    }
+    requested_keys <- paste(full_windows$start, full_windows$end, sep = "||")
+    if (anyDuplicated(requested_keys)) stop("Duplicate requested full windows.")
+    existing_keys <- vapply(intervals, function(x) paste(x$start, x$end, sep = "||"), character(1))
+    if (any(requested_keys %in% existing_keys)) {
+      stop("A requested full window duplicates an ordinary interval.")
+    }
+    extra <- lapply(seq_len(nrow(full_windows)), function(i) {
+      row <- full_windows[i, , drop = FALSE]
+      start <- as.character(row$start)
+      end <- as.character(row$end)
+      alias <- as.character(row$start_alias)
+      if (anyNA(c(start, end)) || !all(c(start, end) %in% karyotyped_ids) || start == end) {
+        stop("Full-window endpoints must be distinct sampled native passages.")
+      }
+      if (is.na(alias) || !nzchar(alias)) alias <- NULL
+      if (!is.null(alias) && !identical(alias, unname(parent_of[start]))) {
+        stop("Full-window proxy must name the exact native parent of its start sample.")
+      }
+      path_ids <- if (is.null(alias)) get_path_between(start, end, parent_of) else
+        c(start, get_path_between(alias, end, parent_of))
+      if (anyDuplicated(path_ids)) {
+        stop("A full-window proxy cannot duplicate a passage already on the physical path.")
+      }
+      if (anyNA(condition_of[path_ids]) || any(!nzchar(condition_of[path_ids]))) {
+        stop("Full-window path contains missing exposure annotations.")
+      }
+      interval <- build_interval(start, end, alias)
+      interval$comparison_type <- "explicit_full_window"
+      interval$model_path_passage_ids <- path_ids
+      interval
+    })
+    intervals <- c(intervals, extra)
+  }
   if (!length(intervals)) {
     return(intervals)
   }
@@ -369,9 +409,19 @@ resolve_interval_condition <- function(condition_counts) {
 # Add karyotype matrices and metadata to tree-derived intervals.
 # Inputs: `connected_trees` list and optional `karyotypes` table with `id` and `karyotype`.
 # Output: flat list of simulation-ready interval records.
-build_simulation_intervals <- function(connected_trees, karyotypes = NULL) {
+build_simulation_intervals <- function(connected_trees, karyotypes = NULL, full_windows = NULL) {
   if (is.null(names(connected_trees))) {
     names(connected_trees) <- as.character(seq_along(connected_trees))
+  }
+  if (!is.null(full_windows)) {
+    if (!is.data.frame(full_windows) ||
+        !all(c("connected_tree", "start", "end", "start_alias") %in% names(full_windows))) {
+      stop("full_windows requires connected_tree, start, end and start_alias columns.")
+    }
+    if (anyNA(full_windows$connected_tree) ||
+        !all(full_windows$connected_tree %in% names(connected_trees))) {
+      stop("Requested full window has an unknown connected tree.")
+    }
   }
 
   empty_karyotype <- matrix(NA_real_, nrow = 1, ncol = 1)
@@ -407,7 +457,9 @@ build_simulation_intervals <- function(connected_trees, karyotypes = NULL) {
   intervals_by_tree <- lapply(seq_along(connected_trees), function(i) {
     tree_name <- names(connected_trees)[i]
     tree <- connected_trees[[i]]
-    tree_intervals <- extract_karyotyped_intervals(tree)
+    requested <- if (is.null(full_windows)) NULL else
+      full_windows[full_windows$connected_tree == tree_name, , drop = FALSE]
+    tree_intervals <- extract_karyotyped_intervals(tree, full_windows = requested)
 
     lapply(tree_intervals, function(interval) {
       start_ids <- tree$tree_samples$samples[tree$tree_samples$passage_id == interval$start]

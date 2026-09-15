@@ -44,7 +44,19 @@ run_parallel_forward_runs <- function(group_intervals,
                                       n_reps,
                                       record_every,
                                       seed,
-                                      n_cores = 1L) {
+                                      n_cores = 1L,
+                                      checkpoint_dir = NULL,
+                                      checkpoint_batch_size = n_cores) {
+  if (!is.null(checkpoint_dir)) {
+    source("R/forward_checkpoint_utils.R")
+    return(run_checkpointed_forward_runs(
+      group_intervals = group_intervals, fit_row = fit_row,
+      bottleneck_size = bottleneck_size, expansion_factor = expansion_factor,
+      n_reps = n_reps, record_every = record_every, seed = seed,
+      checkpoint_dir = checkpoint_dir, n_cores = n_cores,
+      batch_size = checkpoint_batch_size
+    ))
+  }
   n_cores <- max(1L, as.integer(n_cores))
   if (n_cores <= 1L) {
     return(simulate_group_forward(
@@ -113,7 +125,10 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
                                         n_null_pairs = 100L,
                                         n_cores = default_forward_n_cores(),
                                         seed = 1L,
-                                        distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+                                        distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
+                                        checkpoint_dir = NULL,
+                                        checkpoint_batch_size = n_cores,
+                                        update_aggregate = missing(summary_output_path)) {
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("run_forward_validation_main() requires a non-empty `forward_group_id`.")
   }
@@ -142,8 +157,13 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     n_reps = as.integer(n_reps),
     record_every = as.integer(record_every),
     seed = as.integer(seed),
-    n_cores = as.integer(n_cores)
+    n_cores = as.integer(n_cores),
+    checkpoint_dir = checkpoint_dir,
+    checkpoint_batch_size = checkpoint_batch_size
   )
+
+  checkpoint_receipts <- attr(forward_runs, "checkpoint_receipts")
+  attr(forward_runs, "checkpoint_receipts") <- NULL
 
   forward_validation <- summarize_forward_validation(
     forward_runs = forward_runs,
@@ -170,12 +190,13 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     forward_runs = forward_runs,
     forward_validation = forward_validation
   )
+  if (!is.null(checkpoint_receipts)) out$checkpoint_receipts <- checkpoint_receipts
 
   saveRDS(out, output_path)
   saveRDS(forward_validation_summary_object(out), summary_output_path)
   message("Saved forward validation to ", output_path)
   message("Saved forward validation summary to ", summary_output_path)
-  if (identical(
+  if (isTRUE(update_aggregate) && identical(
     normalizePath(dirname(summary_output_path), mustWork = FALSE),
     normalizePath("result_summaries", mustWork = FALSE)
   )) {
@@ -185,7 +206,7 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
       output_path = "data/neutral_probability.csv"
     )
   } else {
-    message("Skipped aggregate neutral_probability.csv update for non-default summary directory: ", dirname(summary_output_path))
+    message("Skipped aggregate neutral_probability.csv update for explicitly routed or non-default summary output: ", summary_output_path)
   }
   out
 }
@@ -205,7 +226,10 @@ load_forward_validation_result <- function(forward_group_id,
                                            n_null_pairs = 100L,
                                            n_cores = default_forward_n_cores(),
                                            seed = 1L,
-                                           distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+                                           distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
+                                           checkpoint_dir = NULL,
+                                           checkpoint_batch_size = n_cores,
+                                           update_aggregate = missing(summary_output_path)) {
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("load_forward_validation_result() requires a non-empty `forward_group_id`.")
   }
@@ -214,7 +238,9 @@ load_forward_validation_result <- function(forward_group_id,
   }
   distance_metric <- match.arg(distance_metric)
 
-  needs_refresh <- !file.exists(output_path)
+  # The legacy monolith cache only checks the distance metric. Opt-in checkpoint
+  # runs instead validate every simulation identity and rerun the cheap reporter.
+  needs_refresh <- !file.exists(output_path) || !is.null(checkpoint_dir)
   if (!needs_refresh) {
     cached_result <- readRDS(output_path)
     cached_metric <- if (!is.null(cached_result$settings$distance_metric)) {
@@ -239,7 +265,10 @@ load_forward_validation_result <- function(forward_group_id,
       n_null_pairs = n_null_pairs,
       n_cores = n_cores,
       seed = seed,
-      distance_metric = distance_metric
+      distance_metric = distance_metric,
+      checkpoint_dir = checkpoint_dir,
+      checkpoint_batch_size = checkpoint_batch_size,
+      update_aggregate = update_aggregate
     )
   }
 
@@ -253,6 +282,8 @@ if (sys.nframe() == 0L) {
     optparse::make_option("--forward_group_id", type = "character", default = NULL),
     optparse::make_option("--output_path", type = "character", default = "results/forward_validation.Rds"),
     optparse::make_option("--summary_output_path", type = "character", default = NULL),
+    optparse::make_option("--checkpoint_dir", type = "character", default = NULL),
+    optparse::make_option("--checkpoint_batch_size", type = "integer", default = NULL),
     optparse::make_option("--bottleneck_size", type = "integer", default = 1000L),
     optparse::make_option("--expansion_factor", type = "integer", default = 32L),
     optparse::make_option("--n_reps", type = "integer", default = 30L),
@@ -274,6 +305,7 @@ if (sys.nframe() == 0L) {
   }
 
   summary_output_path <- opt$summary_output_path
+  update_aggregate <- is.null(summary_output_path) || !nzchar(summary_output_path)
   if (is.null(summary_output_path) || !nzchar(summary_output_path)) {
     summary_output_path <- forward_validation_summary_path(opt$output_path)
   }
@@ -291,6 +323,9 @@ if (sys.nframe() == 0L) {
     n_null_pairs = opt$n_null_pairs,
     n_cores = opt$n_cores,
     seed = opt$seed,
-    distance_metric = opt$distance_metric
+    distance_metric = opt$distance_metric,
+    checkpoint_dir = opt$checkpoint_dir,
+    checkpoint_batch_size = if (is.null(opt$checkpoint_batch_size)) opt$n_cores else opt$checkpoint_batch_size,
+    update_aggregate = update_aggregate
   )
 }
