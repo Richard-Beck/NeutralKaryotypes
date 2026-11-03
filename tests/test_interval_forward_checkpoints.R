@@ -122,7 +122,7 @@ test_forward_default_routing <- function() {
             identical(route$aggregate_args$output_path, "data/neutral_probability.csv"))
 
   writer_env <- new.env(parent = globalenv())
-  writer_env$write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern) {
+  writer_env$write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern, fit_mode) {
     list(summary_dir = summary_dir, output_path = output_path)
   }
   writer <- write_neutral_probability_csv
@@ -145,20 +145,22 @@ test_forward_default_routing <- function() {
     cli[[entrypoint]] <- function(...) list(...)
     eval(expression, cli)
   }
-  for (mode in c("pooled_group_v1", new_mode)) {
+  for (mode in c("pooled_group_v1", new_mode, "interval_independent_v1")) {
     defaults <- forward_validation_default_paths(mode)
     single_cli <- capture_cli("scripts/run_forward_validation.R", c(paste0("--fit_mode=", mode), "--forward_group_id=group_a", "--n_cores=1"), "run_forward_validation_main")
     all_cli <- capture_cli("scripts/run_forward_validation_all.R", c(paste0("--fit_mode=", mode), "--n_cores=1"), "run_forward_validation_all_main")
     stopifnot(identical(single_cli$group_fit_path, defaults$group_fit_path), identical(single_cli$output_path, defaults$output_path),
               identical(single_cli$summary_output_path, forward_validation_summary_path(defaults$output_path, mode)),
               identical(single_cli$update_aggregate, mode == "pooled_group_v1"),
+              identical(single_cli$calibration_status, "pending_refit_calibration"),
               identical(all_cli$group_fit_path, defaults$group_fit_path), identical(all_cli$output_dir, defaults$output_dir),
               identical(all_cli$summary_output_dir, defaults$summary_output_dir), identical(all_cli$aggregate_output_path, defaults$aggregate_output_path))
   }
-  single_cli <- capture_cli("scripts/run_forward_validation.R", c(paste0("--fit_mode=", new_mode), "--forward_group_id=group_a", "--group_fit_path=custom/fit.Rds", "--output_path=custom/run.Rds", "--summary_output_path=custom/summary.Rds", "--checkpoint_dir=custom/checkpoints"), "run_forward_validation_main")
-  all_cli <- capture_cli("scripts/run_forward_validation_all.R", c(paste0("--fit_mode=", new_mode), "--group_fit_path=custom/fit.Rds", "--output_dir=custom/results", "--summary_output_dir=custom/summaries", "--aggregate_output_path=custom/diagnostics.csv"), "run_forward_validation_all_main")
+  single_cli <- capture_cli("scripts/run_forward_validation.R", c(paste0("--fit_mode=", new_mode), "--forward_group_id=group_a", "--group_fit_path=custom/fit.Rds", "--output_path=custom/run.Rds", "--summary_output_path=custom/summary.Rds", "--checkpoint_dir=custom/checkpoints", "--calibration_status=deferred_by_user"), "run_forward_validation_main")
+  all_cli <- capture_cli("scripts/run_forward_validation_all.R", c(paste0("--fit_mode=", new_mode), "--group_fit_path=custom/fit.Rds", "--output_dir=custom/results", "--summary_output_dir=custom/summaries", "--aggregate_output_path=custom/diagnostics.csv", "--calibration_status=deferred_by_user"), "run_forward_validation_all_main")
   stopifnot(identical(single_cli$group_fit_path, "custom/fit.Rds"), identical(single_cli$output_path, "custom/run.Rds"),
             identical(single_cli$summary_output_path, "custom/summary.Rds"), identical(single_cli$checkpoint_dir, "custom/checkpoints"),
+            identical(single_cli$calibration_status, "deferred_by_user"), identical(all_cli$calibration_status, "deferred_by_user"),
             identical(all_cli$group_fit_path, "custom/fit.Rds"), identical(all_cli$output_dir, "custom/results"),
             identical(all_cli$summary_output_dir, "custom/summaries"), identical(all_cli$aggregate_output_path, "custom/diagnostics.csv"))
   message("PASS: interval function/loader/CLI/writer defaults preserve pooled artifacts; explicit paths and pooled defaults remain unchanged.")
@@ -177,6 +179,94 @@ fixture <- function(end, end_value = 2) list(
   start_karyotype = matrix(c(2, 2, 2, 3), ncol = 2L),
   end_karyotype = matrix(c(end_value, 2, 2, 3), ncol = 2L),
   conditions = c(control = 1), fixture_scope = "synthetic_smoke_only")
+
+test_independent_forward_contract <- function() {
+  test_root <- tempfile("independent-forward-contract-")
+  dir.create(test_root)
+  original_nll <- get_interval_nll_markov
+  original_simulator <- simulate_interval_forward
+  on.exit({
+    assign("get_interval_nll_markov", original_nll, envir = globalenv())
+    assign("simulate_interval_forward", original_simulator, envir = globalenv())
+    unlink(test_root, recursive = TRUE)
+  }, add = TRUE)
+  assign("get_interval_nll_markov", function(p_mis, p_wgd, K0, KT, n_div, states = 0:8, eps = 1e-9) {
+    if (KT[1L, 1L] == 5) return(Inf)
+    target_p <- if (KT[1L, 1L] == 2) 0.001 else 0.04
+    target_q <- if (KT[1L, 1L] == 2) 0 else 0.02
+    1e5 * ((p_mis - target_p)^2 + (p_wgd - target_q)^2)
+  }, envir = globalenv())
+  assign("simulate_interval_forward", function(interval, p_mis, p_wgd, bottleneck_size,
+                                                expansion_factor, record_every, divide_all_each_step, seed) {
+    set.seed(seed)
+    list(interval = interval, p_mis = p_mis, p_wgd = p_wgd,
+         final_matrix = interval$start_karyotype[sample(seq_len(nrow(interval$start_karyotype)), 4L, replace = TRUE), , drop = FALSE])
+  }, envir = globalenv())
+  mode <- "interval_independent_v1"
+  groups <- list(group_a = list(fixture("independent_end_a"), fixture("independent_end_b", 3)))
+  fit <- function(grouped, fit_mode = mode) nk_select_interval_fits(nk_interval_fit_grid(
+    grouped, c(0.001, 0.04), c(0, 0.02), fit_mode = fit_mode))
+  fits <- fit(groups)
+  shared <- fit(groups, "interval_shared_wgd_v1")
+  ids <- nk_interval_roster(groups)$physical_interval_id
+  fits <- fits[match(ids, fits$physical_interval_id), , drop = FALSE]
+  stopifnot(identical(fits$pwgd, c(0, 0.02)), identical(fits$pmis, c(0.001, 0.04)),
+            all(fits$wgd_scope == "physical_interval"))
+  seeds <- forward_rng_roster(ids, 3L, 1L)
+  raw_root <- file.path(test_root, "checkpoints")
+  run <- function(selected, grouped = groups, fit_mode = mode) run_checkpointed_forward_runs(
+    grouped[[1L]], selected, 4L, 2L, 3L, 1L, 1L, checkpoint_dir = raw_root,
+    fit_mode = fit_mode, seed_roster = seeds)
+  shared_runs <- run(shared, fit_mode = "interval_shared_wgd_v1")
+  independent_runs <- run(fits)
+  stopifnot(sum(attr(independent_runs, "checkpoint_receipts")$reused) == 3L)
+  for (i in seq_along(independent_runs)) {
+    stopifnot(all(vapply(independent_runs[[i]], function(x) identical(x$p_mis, fits$pmis[i]) && identical(x$p_wgd, fits$pwgd[i]), logical(1))))
+  }
+  expect_error(run(shared), "requested fit mode")
+  summary <- function(runs, selected, grouped = groups, calibration_status = "pending_refit_calibration") summarize_forward_validation(
+    runs, grouped[[1L]], names(grouped)[1L], n_null_pairs = 2L, distance_metric = "wasserstein",
+    fit_mode = mode, fit_rows = selected, seed_roster = seeds, checkpoint_dir = raw_root, calibration_status = calibration_status)
+  pending <- summary(independent_runs, fits)
+  deferred <- summary(independent_runs, fits, calibration_status = "deferred_by_user")
+  stopifnot(all(deferred$interval_summary$calibration_status == "deferred_by_user"),
+            identical(deferred$calibration$status, "deferred_by_user"),
+            all(is.na(deferred$interval_summary$p_value)), all(is.na(deferred$interval_summary$q_value)),
+            all(!deferred$interval_summary$inference_eligible),
+            all(vapply(deferred$interval_checks, function(x) isTRUE(attr(x, "checkpoint_reused")), logical(1))))
+  changed_groups <- groups
+  changed_groups$group_a[[2L]]$end_karyotype[2L, 1L] <- 4
+  changed_fits <- fit(changed_groups)
+  changed_runs <- run(changed_fits, changed_groups)
+  changed_summary <- summary(changed_runs, changed_fits, changed_groups)
+  stopifnot(all(attr(changed_runs, "checkpoint_receipts")$reused),
+            identical(pending$calibration$interval_dependency_sha256[ids[1L]], changed_summary$calibration$interval_dependency_sha256[ids[1L]]))
+  summary_dir <- file.path(test_root, "summaries")
+  dir.create(summary_dir)
+  grouped_path <- file.path(test_root, "groups.Rds")
+  saveRDS(groups, grouped_path)
+  result <- list(forward_group_id = "group_a", fit_row = fits, settings = list(fit_mode = mode, calibration_status = "deferred_by_user"),
+                 forward_validation = deferred, seed_roster = seeds)
+  saveRDS(forward_validation_summary_object(result), file.path(summary_dir, "forward_validation_group_a_summary.Rds"))
+  csv <- write_neutral_probability_csv(summary_dir, grouped_path, file.path(test_root, "diagnostics.csv"), fit_mode = mode)
+  stopifnot(setequal(csv$pwgd, c(0, 0.02)), all(csv$calibration_status == "deferred_by_user"),
+            all(is.na(csv$p_value)), all(is.na(csv$q_value)))
+  expect_error(write_neutral_probability_csv(summary_dir, grouped_path, file.path(test_root, "wrong_mode.csv"), fit_mode = "interval_shared_wgd_v1"), "rejects legacy, mixed")
+  unavailable_groups <- groups
+  unavailable_groups$group_a[[2L]]$end_karyotype[1L, 1L] <- 5
+  unavailable_fits <- fit(unavailable_groups)
+  unavailable_runs <- run(unavailable_fits, unavailable_groups)
+  unavailable_summary <- summary(unavailable_runs, unavailable_fits, unavailable_groups)
+  stopifnot(length(unavailable_runs[[1L]]) == 3L, length(unavailable_runs[[2L]]) == 0L,
+            unavailable_summary$interval_summary$forward_status[2L] == "not_simulated_non_estimable_fit")
+  message("PASS: independent interval p/q pairs, matching raw-task reuse, isolated dependencies, mixed estimability and explicit deferred calibration policy.")
+}
+
+test_independent_forward_contract()
+if ("--independent-only" %in% commandArgs(trailingOnly = TRUE)) {
+  message("Focused independent forward/policy tests passed; production and simulator suites were not repeated.")
+  quit(status = 0L)
+}
 groups <- list(group_a = list(fixture("physical_end_a"), fixture("physical_end_b", 3)))
 test_root <- tempfile("interval-forward-smoke-")
 dir.create(test_root)

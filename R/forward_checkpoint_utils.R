@@ -116,13 +116,15 @@ forward_checkpoint_function_hash <- function(function_names) {
   }, character(1)), function_names)
 }
 
-forward_checkpoint_interval_contract <- function(group_intervals, fit_rows, settings, seed_roster = NULL) {
+forward_checkpoint_interval_contract <- function(group_intervals, fit_rows, settings, seed_roster = NULL,
+                                                 fit_mode = "interval_shared_wgd_v1") {
   if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
   if (!is.data.frame(fit_rows) || length(unique(fit_rows$group_id)) != 1L) {
     stop("Interval forward checkpoints require exactly one coupled group of interval fits.")
   }
   grouped <- stats::setNames(list(group_intervals), unique(as.character(fit_rows$group_id)))
   fit_rows <- nk_validate_interval_fits(fit_rows, grouped)
+  if (any(fit_rows$fit_mode != fit_mode)) stop("Checkpoint fits do not match the requested fit mode.")
   ids <- unname(vapply(group_intervals, nk_physical_interval_id, character(1)))
   fit_rows <- fit_rows[match(ids, fit_rows$physical_interval_id), , drop = FALSE]
   if (is.null(seed_roster)) seed_roster <- forward_rng_roster(ids, settings$n_reps, settings$seed)
@@ -153,7 +155,7 @@ forward_checkpoint_interval_contract <- function(group_intervals, fit_rows, sett
          pmis = unname(fit_rows$pmis[i]), pwgd = unname(fit_rows$pwgd[i]),
          settings = simulation_settings, kernel = kernel, runtime = runtime)
   })
-  identity <- list(schema_version = "neutral_forward_checkpoint_v2", fit_mode = "interval_shared_wgd_v1",
+  identity <- list(schema_version = "neutral_forward_checkpoint_v2", fit_mode = fit_mode,
                    group_intervals = group_intervals, fit_row = fit_rows, settings = settings,
                    physical_interval_ids = ids, simulation_intervals = simulation_intervals,
                    raw_identities = raw_identities, seed_roster = seed_roster,
@@ -163,14 +165,14 @@ forward_checkpoint_interval_contract <- function(group_intervals, fit_rows, sett
 
 forward_checkpoint_contract <- function(group_intervals, fit_row, bottleneck_size,
                                         expansion_factor, n_reps, record_every, seed,
-                                        fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1"),
+                                        fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
                                         seed_roster = NULL) {
   fit_mode <- match.arg(fit_mode)
   if (!length(group_intervals)) stop("No intervals supplied for forward checkpoints.")
   if (!is.data.frame(fit_row) || (fit_mode == "pooled_group_v1" && nrow(fit_row) != 1L) ||
       !nrow(fit_row) ||
       !all(c("pmis", "pwgd") %in% names(fit_row)) ||
-      any(!is.finite(c(fit_row$pmis, fit_row$pwgd)))) {
+      (fit_mode == "pooled_group_v1" && any(!is.finite(c(fit_row$pmis, fit_row$pwgd))))) {
     stop("Forward checkpoints require complete fitted-parameter rows at the declared fit scope.")
   }
   if (fit_mode == "pooled_group_v1" && "physical_interval_id" %in% names(fit_row)) {
@@ -198,8 +200,8 @@ forward_checkpoint_contract <- function(group_intervals, fit_row, bottleneck_siz
     divide_all_each_step = TRUE,
     seed_formula = "seed + rep_idx + 1000 * interval_idx"
   )
-  if (fit_mode == "interval_shared_wgd_v1") {
-    return(forward_checkpoint_interval_contract(group_intervals, fit_row, settings, seed_roster))
+  if (fit_mode != "pooled_group_v1") {
+    return(forward_checkpoint_interval_contract(group_intervals, fit_row, settings, seed_roster, fit_mode))
   }
   if (as.double(seed) + n_reps + 1000 * length(group_intervals) > .Machine$integer.max) {
     stop("The existing deterministic task seed formula would overflow.")
@@ -355,6 +357,8 @@ load_forward_checkpoint_runs <- function(checkpoint_dir, interval_indices = NULL
   interval_indices <- forward_checkpoint_indices(interval_indices, seq_along(contract$identity$group_intervals), "interval_indices")
   replicate_indices <- forward_checkpoint_indices(replicate_indices, seq_len(contract$identity$settings$n_reps), "replicate_indices")
   lapply(interval_indices, function(interval_idx) {
+    if (forward_checkpoint_is_interval(contract) &&
+        (!is.finite(contract$identity$fit_row$pmis[interval_idx]) || !is.finite(contract$identity$fit_row$pwgd[interval_idx]))) return(list())
     lapply(replicate_indices, function(rep_idx) {
       path <- forward_checkpoint_task_path(checkpoint_dir, interval_idx, rep_idx, contract)
       result <- forward_checkpoint_read_task(path, contract, interval_idx, rep_idx)$result
@@ -371,7 +375,7 @@ run_checkpointed_forward_runs <- function(group_intervals, fit_row, bottleneck_s
                                          checkpoint_dir, n_cores = 1L,
                                          batch_size = n_cores, load_results = TRUE,
                                          interval_indices = NULL, replicate_indices = NULL,
-                                         fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1"),
+                                         fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
                                          seed_roster = NULL) {
   fit_mode <- match.arg(fit_mode)
   n_cores <- forward_checkpoint_integer(n_cores, "n_cores")
@@ -414,6 +418,10 @@ run_checkpointed_forward_runs <- function(group_intervals, fit_row, bottleneck_s
   interval_indices <- forward_checkpoint_indices(interval_indices, seq_along(group_intervals), "interval_indices")
   replicate_indices <- forward_checkpoint_indices(replicate_indices, seq_len(n_reps), "replicate_indices")
   requested <- tasks$interval_idx %in% interval_indices & tasks$rep_idx %in% replicate_indices
+  eligible <- if (forward_checkpoint_is_interval(contract)) {
+    is.finite(contract$identity$fit_row$pmis[tasks$interval_idx]) & is.finite(contract$identity$fit_row$pwgd[tasks$interval_idx])
+  } else rep(TRUE, nrow(tasks))
+  requested <- requested & eligible
   expected_paths <- vapply(seq_len(nrow(tasks)), function(i) {
     forward_checkpoint_task_path(checkpoint_dir, tasks$interval_idx[i], tasks$rep_idx[i], contract)
   }, character(1))
@@ -421,6 +429,7 @@ run_checkpointed_forward_runs <- function(group_intervals, fit_row, bottleneck_s
   if (length(extra)) stop("Unexpected checkpoint task files: ", paste(basename(extra), collapse = ", "))
   receipts <- vector("list", nrow(tasks))
   completed <- file.exists(expected_paths)
+  if (any(completed & !eligible)) stop("Unexpected raw simulation task for a non-estimable interval.")
   for (i in which(completed)) {
     task <- forward_checkpoint_read_task(expected_paths[i], contract, tasks$interval_idx[i], tasks$rep_idx[i])
     receipts[[i]] <- forward_checkpoint_task_receipt(expected_paths[i], task, reused = TRUE, contract = contract, interval_idx = tasks$interval_idx[i])
@@ -483,7 +492,7 @@ run_checkpointed_forward_runs <- function(group_intervals, fit_row, bottleneck_s
   rownames(receipt_table) <- NULL
   if (!load_results) {
     return(list(checkpoint_dir = checkpoint_dir, contract = contract, receipts = receipt_table,
-                requested_tasks = tasks[requested, , drop = FALSE], complete = all(completed)))
+                requested_tasks = tasks[requested, , drop = FALSE], complete = all(completed | !eligible)))
   }
   out <- load_forward_checkpoint_runs(checkpoint_dir, interval_indices, replicate_indices, contract = contract)
   attr(out, "checkpoint_receipts") <- receipt_table

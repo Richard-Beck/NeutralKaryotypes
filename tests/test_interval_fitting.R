@@ -150,5 +150,96 @@ entry <- fit_group_markov_main(input_path, output_path, q, p, "interval_shared_w
 same(readRDS(selected_path)$fit_id, fits$fit_id)
 stopifnot(nrow(readRDS(output_path)) == nrow(grid), length(attr(readRDS(selected_path), "profiles")) == 2L)
 fails(load_group_markov_results(input_path, output_path, q, p, "pooled_group_v1"))
+
+# The authorized independent mode selects both parameters within each interval.
+# Import the old v1 surface format, without changing its shared-WGD fit rows.
+historical_grid <- grid
+attr(historical_grid, "surface_settings") <- NULL
+attr(historical_grid, "surface_schema") <- NULL
+independent_root <- file.path(scratch, "independent")
+independent_grid <- nk_interval_fit_grid(groups, p, q, independent_root,
+  fit_mode = "interval_independent_v1", reuse_grid = historical_grid)
+independent <- nk_select_interval_fits(independent_grid)
+stopifnot(all(independent$fit_mode == "interval_independent_v1"), all(independent$wgd_scope == "physical_interval"),
+          all(is.na(independent$group_profile_id)), all(is.na(independent$group_negll)),
+          length(unique(independent$pwgd[independent$group_id == "g"])) == 2L,
+          all(attr(independent_grid, "interval_checkpoints")$reuse_kind == "authenticated_surface"),
+          all(attr(independent, "profile_checkpoints")$cache_status == "computed"))
+for (id in independent$physical_interval_id) {
+  raw <- grid[grid$physical_interval_id == id, ]
+  raw <- raw[order(raw$negll, raw$pwgd, raw$pmis), ]
+  selected <- independent[independent$physical_interval_id == id, ]
+  same(selected[c("pmis", "pwgd", "negll")], raw[1L, c("pmis", "pwgd", "negll")])
+  profile <- attr(independent, "profiles")[[id]]
+  same(profile$pwgd_profiles$negll, vapply(sort(q), function(value) min(raw$negll[raw$pwgd == value]), numeric(1)))
+  same(profile$pmis_profiles$negll, vapply(sort(p), function(value) min(raw$negll[raw$pmis == value]), numeric(1)))
+}
+same(independent[independent$group_id == "h", c("pmis", "pwgd", "negll")], fits[fits$group_id == "h", c("pmis", "pwgd", "negll")])
+stopifnot(sum(independent$negll) < sum(fits$negll))
+independent_api <- estimate_group_pmis_grid(groups, p, q, fit_mode = "interval_independent_v1", reuse_grid = grid)
+same(nk_select_interval_fits(independent_api)$fit_id, independent$fit_id)
+same(estimate_group_pmis_grid(groups, p, q, fit_mode = "pooled_group_v1"), old)
+
+# A changed interval invalidates exactly its own surface, profile and fit.
+independent_changed_grid <- nk_interval_fit_grid(changed, p, q, independent_root, fit_mode = "interval_independent_v1")
+independent_changed <- nk_select_interval_fits(independent_changed_grid)
+stopifnot(sum(attr(independent_changed_grid, "interval_checkpoints")$cache_status == "computed") == 1L,
+          sum(attr(independent_changed, "profile_checkpoints")$cache_status == "computed") == 1L)
+changed_id <- nk_physical_interval_id(changed$g[[1L]])
+m <- match(independent$physical_interval_id, independent_changed$physical_interval_id)
+stopifnot(all((independent$fit_id != independent_changed$fit_id[m]) == (independent$physical_interval_id == changed_id)),
+          all((independent$fit_dependency_id != independent_changed$fit_dependency_id[m]) == (independent$physical_interval_id == changed_id)))
+fails(nk_validate_interval_fits(independent, changed))
+
+# Group relabeling, regrouping, removal, additions and row order are metadata
+# changes for independently selected parameters and dependency identities.
+regrouped <- list(new_group = c(rev(groups$g), groups$h))
+regrouped_grid <- nk_interval_fit_grid(regrouped, rev(p), rev(q), independent_root, fit_mode = "interval_independent_v1")
+regrouped_fits <- nk_select_interval_fits(regrouped_grid[nrow(regrouped_grid):1L, ])
+same(regrouped_fits$fit_id, independent$fit_id)
+stopifnot(all(attr(regrouped_grid, "interval_checkpoints")$cache_status == "reused"),
+          all(attr(regrouped_fits, "profile_checkpoints")$cache_status == "reused"))
+single_only <- nk_select_interval_fits(nk_interval_fit_grid(list(only = groups$g[1L]), p, q,
+  independent_root, fit_mode = "interval_independent_v1"))
+same(single_only$fit_id, independent$fit_id[independent$physical_interval_id == nk_physical_interval_id(groups$g[[1L]])])
+extended <- c(groups, list(extra = list(make_interval("new", c(4, 4, 4, 4)))))
+extended_fits <- nk_select_interval_fits(nk_interval_fit_grid(extended, p, q, independent_root, fit_mode = "interval_independent_v1"))
+same(independent$fit_id, extended_fits$fit_id[match(independent$physical_interval_id, extended_fits$physical_interval_id)])
+
+independent_tie <- nk_select_interval_fits(nk_interval_fit_grid(tie_groups, rev(p), rev(q), fit_mode = "interval_independent_v1"))
+stopifnot(independent_tie$pmis == min(p), independent_tie$pwgd == min(q),
+          independent_tie$joint_tie_count == length(p) * length(q),
+          independent_tie$pmis_flat, independent_tie$pwgd_flat,
+          independent_tie$estimability_status == "tied_grid_optimum")
+partly_unavailable <- independent_grid
+partly_unavailable$negll[partly_unavailable$physical_interval_id == changed_id] <- Inf
+attr(partly_unavailable, "grid_sha256") <- NULL
+independent_unavailable <- nk_select_interval_fits(partly_unavailable)
+stopifnot(sum(independent_unavailable$estimability_status == "no_finite_interval_grid") == 1L)
+same(independent_unavailable$fit_id[independent_unavailable$physical_interval_id != changed_id],
+     independent$fit_id[independent$physical_interval_id != changed_id])
+
+# A changed reuse source input is recomputed; corrupt source metadata fails.
+reuse_changed <- nk_interval_fit_grid(changed, p, q, fit_mode = "interval_independent_v1", reuse_grid = historical_grid)
+stopifnot(sum(attr(reuse_changed, "interval_checkpoints")$cache_status == "computed") == 1L)
+bad_source <- historical_grid
+attr(bad_source, "model_identity")$eps <- 1
+fails(nk_interval_fit_grid(groups, p, q, fit_mode = "interval_independent_v1", reuse_grid = bad_source))
+bad <- independent
+bad$fit_mode <- "interval_shared_wgd_v1"
+fails(nk_validate_interval_fits(bad))
+bad <- fits
+bad$fit_mode <- "interval_independent_v1"
+fails(nk_validate_interval_fits(bad))
+bad <- independent
+bad$fit_dependency_id[1L] <- bad$fit_dependency_id[2L]
+fails(nk_validate_interval_fits(bad))
+
+independent_output <- file.path(independent_root, "interval_fit_grid.Rds")
+independent_selected_path <- file.path(independent_root, "interval_fits.Rds")
+independent_entry <- fit_group_markov_main(input_path, independent_output, q, p, "interval_independent_v1",
+  independent_root, independent_selected_path, reuse_grid_path = output_path)
+same(readRDS(independent_selected_path)$fit_id, independent$fit_id)
+same(readRDS(selected_path)$fit_id, fits$fit_id)
 unlink(scratch, recursive = TRUE)
-message("Interval kernel parity, exhaustive shared-WGD profiling, identities, ties, caches and entrypoint checks passed.")
+message("Shared/independent interval numerics, frozen pooled parity, authenticated surface reuse, dependency isolation, ties, caches and entrypoints passed.")

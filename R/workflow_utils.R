@@ -292,19 +292,27 @@ assert_legacy_pooled_fits <- function(fits) {
 }
 
 select_forward_fits <- function(fit_table, grouped_intervals,
-                                fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+                                fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
   if (fit_mode == "pooled_group_v1") return(select_best_group_fits(fit_table))
   if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
   selected <- nk_select_interval_fits(fit_table)
+  if (any(selected$fit_mode != fit_mode)) stop("Selected interval fits do not match the requested fit mode.")
   nk_validate_interval_fits(selected, grouped_intervals)
 }
 
 # Keep opt-in interval outputs separate from frozen pooled artifacts. Explicit
 # caller paths are still authoritative; these values apply only when omitted.
-forward_validation_default_paths <- function(fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+forward_validation_default_paths <- function(fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  interval_mode <- fit_mode == "interval_shared_wgd_v1"
+  if (fit_mode == "interval_independent_v1") {
+    return(list(group_fit_path = "results/interval_independent/interval_fit_grid.Rds",
+                output_dir = "results/interval_independent/forward_validation",
+                output_path = "results/interval_independent/forward_validation/forward_validation.Rds",
+                summary_output_dir = "result_summaries/interval_independent",
+                aggregate_output_path = "data/neutral_interval_independent_diagnostics.csv"))
+  }
+  interval_mode <- fit_mode != "pooled_group_v1"
   output_dir <- if (interval_mode) "results/interval_forward_validation" else "results"
   list(
     group_fit_path = if (interval_mode) "results/interval_fit_grid.Rds" else "results/group_fit_df.Rds",
@@ -319,11 +327,12 @@ forward_validation_default_paths <- function(fit_mode = c("pooled_group_v1", "in
 # Inputs: grouped intervals and the best-per-`p_wgd` fit table.
 # Output: list with `predicted` and `observed` data.frames ready for plotting.
 build_ploidy_diagnostics <- function(grouped_intervals, best_by_pwgd,
-                                    fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+                                    fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  if (fit_mode == "interval_shared_wgd_v1") {
+  if (fit_mode != "pooled_group_v1") {
     if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
     fits <- nk_validate_interval_fits(best_by_pwgd, grouped_intervals)
+    if (any(fits$fit_mode != fit_mode)) stop("Prediction fits do not match the requested fit mode.")
     if (any(!is.finite(fits$pmis) | !is.finite(fits$pwgd))) stop("Prediction diagnostics require estimable interval fits.")
     rows <- lapply(seq_len(nrow(fits)), function(i) {
       fit <- fits[i, , drop = FALSE]
@@ -391,11 +400,12 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
                                           best_by_pwgd,
                                           chr_idx = 1:2,
                                           states = 0:8,
-                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  if (fit_mode == "interval_shared_wgd_v1") {
+  if (fit_mode != "pooled_group_v1") {
     if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
     best_by_pwgd <- nk_validate_interval_fits(best_by_pwgd, grouped_intervals)
+    if (any(best_by_pwgd$fit_mode != fit_mode)) stop("Prediction fits do not match the requested fit mode.")
     if (any(!is.finite(best_by_pwgd$pmis) | !is.finite(best_by_pwgd$pwgd))) stop("Prediction diagnostics require estimable interval fits.")
   } else assert_legacy_pooled_fits(best_by_pwgd)
   chr_idx <- as.integer(chr_idx)
@@ -405,7 +415,7 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
     group_id <- best_by_pwgd$group_id[i]
     group_intervals <- grouped_intervals[[group_id]]
 
-    indices <- if (fit_mode == "interval_shared_wgd_v1") best_by_pwgd$interval_idx[i] else seq_along(group_intervals)
+    indices <- if (fit_mode != "pooled_group_v1") best_by_pwgd$interval_idx[i] else seq_along(group_intervals)
     do.call(rbind, lapply(indices, function(interval_id) {
       interval <- group_intervals[[interval_id]]
       P_pred <- predict_marginal_cn_probs(
@@ -427,7 +437,7 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
           type = "predicted",
           stringsAsFactors = FALSE
         )
-        if (fit_mode == "interval_shared_wgd_v1") {
+        if (fit_mode != "pooled_group_v1") {
           row$physical_interval_id <- best_by_pwgd$physical_interval_id[i]
           row$fit_id <- best_by_pwgd$fit_id[i]
           row$pmis <- best_by_pwgd$pmis[i]
@@ -456,7 +466,7 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
           type = "observed",
           stringsAsFactors = FALSE
         )
-        if (fit_mode == "interval_shared_wgd_v1") row$physical_interval_id <- nk_physical_interval_id(interval)
+        if (fit_mode != "pooled_group_v1") row$physical_interval_id <- nk_physical_interval_id(interval)
         row
       }))
     }))
@@ -663,16 +673,19 @@ summarize_forward_validation <- function(forward_runs,
                                          n_null_pairs = 100,
                                          seed_base = 10000,
                                          distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
-                                         fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1"),
-                                         fit_rows = NULL, seed_roster = NULL, checkpoint_dir = NULL) {
+                                         fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
+                                         fit_rows = NULL, seed_roster = NULL, checkpoint_dir = NULL,
+                                         calibration_status = c("pending_refit_calibration", "deferred_by_user")) {
   fit_mode <- match.arg(fit_mode)
+  calibration_status <- match.arg(calibration_status)
   distance_metric <- match.arg(distance_metric)
-  interval_mode <- fit_mode == "interval_shared_wgd_v1"
+  interval_mode <- fit_mode != "pooled_group_v1"
   if (length(forward_runs) != length(group_intervals)) stop("Forward run and native interval rosters differ.")
   if (interval_mode) {
     if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
     if (!exists("forward_rng_validate", mode = "function")) source("R/forward_checkpoint_utils.R")
     fit_rows <- nk_validate_interval_fits(fit_rows, stats::setNames(list(group_intervals), group_id))
+    if (any(fit_rows$fit_mode != fit_mode)) stop("Summary fits do not match the requested fit mode.")
     interval_ids <- unname(vapply(group_intervals, nk_physical_interval_id, character(1)))
     fit_rows <- fit_rows[match(interval_ids, fit_rows$physical_interval_id), , drop = FALSE]
     fit_rows <- data.frame(fit_rows, check.names = FALSE, stringsAsFactors = FALSE)
@@ -807,7 +820,7 @@ summarize_forward_validation <- function(forward_runs,
     interval_checks = interval_checks
   )
   if (interval_mode) {
-    identity_columns <- c("physical_interval_id", "fit_id", "fit_mode", "fit_scope", "wgd_scope", "pmis", "pwgd", "negll", "interval_grid_id", "group_profile_id", "semantic_input_sha256", "fit_schema", "estimability_status")
+    identity_columns <- c("physical_interval_id", "fit_id", "fit_mode", "fit_scope", "wgd_scope", "pmis", "pwgd", "negll", "interval_grid_id", "group_profile_id", "interval_profile_id", "fit_dependency_id", "semantic_input_sha256", "fit_schema", "estimability_status")
     identity_columns <- intersect(identity_columns, names(fit_rows))
     ontology_fields <- c("passaging_ontology_run_id", "passaging_ontology_manifest_sha256")
     ontology_values <- lapply(ontology_fields, function(field) {
@@ -838,7 +851,7 @@ summarize_forward_validation <- function(forward_runs,
       df$p_value <- NA_real_
       df$q_value <- NA_real_
       df$check_method <- "plugin_endpoint_check_v2"
-      df$calibration_status <- "pending_refit_calibration"
+      df$calibration_status <- calibration_status
       df$inference_eligible <- FALSE
       df$neutrality_rejected <- NA
       df$forward_status <- ifelse(!is.finite(df$pmis) | !is.finite(df$pwgd), "not_simulated_non_estimable_fit",
@@ -848,13 +861,26 @@ summarize_forward_validation <- function(forward_runs,
     # A future shared-WGD calibration is coupled to the complete group inputs;
     # this pending contract is never interpreted as completed null calibration.
     ord <- order(fit_rows$physical_interval_id)
-    calibration_identity <- list(schema_version = "shared_wgd_calibration_pending_v1",
-                                 status = "pending_method_and_feasibility_decision",
+    calibration_identity <- list(schema_version = if (fit_mode == "interval_independent_v1") "independent_interval_calibration_pending_v1" else "shared_wgd_calibration_pending_v1",
+                                 status = if (calibration_status == "deferred_by_user") "deferred_by_user" else "pending_method_and_feasibility_decision",
                                  fit_rows = fit_rows[ord, setdiff(names(fit_rows), "interval_idx"), drop = FALSE],
                                  interval_inputs = unname(lapply(group_intervals[ord], nk_interval_semantic_input)))
     rownames(calibration_identity$fit_rows) <- NULL
     out$calibration <- list(status = calibration_identity$status, inference_eligible = FALSE,
                             identity_sha256 = forward_checkpoint_hash(calibration_identity), identity = calibration_identity)
+    if (fit_mode == "interval_independent_v1") {
+      # Independent refits depend on their own endpoint data and selected pair.
+      # Persist these dependencies without claiming a completed calibration.
+      dependencies <- lapply(seq_along(group_intervals), function(i) {
+        row <- fit_rows[i, setdiff(names(fit_rows), c("group_id", "interval_idx")), drop = FALSE]
+        rownames(row) <- NULL
+        list(schema_version = "independent_interval_calibration_dependency_v1", fit_row = row,
+             interval_input = nk_interval_semantic_input(group_intervals[[i]]))
+      })
+      names(dependencies) <- interval_ids
+      out$calibration$interval_dependencies <- dependencies
+      out$calibration$interval_dependency_sha256 <- vapply(dependencies, forward_checkpoint_hash, character(1))
+    }
     out$seed_roster <- seed_roster
   }
   out
@@ -863,7 +889,9 @@ summarize_forward_validation <- function(forward_runs,
 # Interval-mode publication requires exact fit/check/native roster equality.
 # It exports the plug-in diagnostic separately from unavailable inferential
 # p/q values, so an old BH consumer cannot promote it automatically.
-write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern) {
+write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern,
+                                                   fit_mode = c("interval_shared_wgd_v1", "interval_independent_v1")) {
+  fit_mode <- match.arg(fit_mode)
   if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
   if (!file.exists(grouped_intervals_path)) stop("Interval summary publication requires the native grouped intervals.")
   grouped <- readRDS(grouped_intervals_path)
@@ -872,13 +900,14 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
   if (!length(paths)) stop("No interval summaries found for the required native roster.")
   tables <- lapply(paths, function(path) {
     res <- readRDS(path)
-    if (!identical(res$settings$fit_mode, "interval_shared_wgd_v1") ||
+    if (!identical(res$settings$fit_mode, fit_mode) ||
         !res$forward_group_id %in% names(grouped)) {
       stop("Interval summary writer rejects legacy, mixed or unknown-group summaries: ", path)
     }
     fits <- nk_validate_interval_fits(res$fit_row, grouped[res$forward_group_id])
     df <- res$interval_summary
     parity <- c("fit_id", "group_id", "pmis", "pwgd", "negll", "fit_mode", "fit_scope", "wgd_scope", "interval_grid_id", "group_profile_id", "semantic_input_sha256", "fit_schema", "estimability_status")
+    if (fit_mode == "interval_independent_v1") parity <- c(parity, "interval_profile_id", "fit_dependency_id")
     required <- c("physical_interval_id", parity,
                   "diagnostic_p", "p_value", "q_value", "check_method", "calibration_status", "inference_eligible", "neutrality_rejected")
     if (!is.data.frame(df) || !all(required %in% names(df)) || anyDuplicated(df$physical_interval_id) ||
@@ -890,7 +919,9 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
       if (!identical(df[[field]], fits[[field]][idx])) stop("Interval summary/fit numeric or identity mismatch in ", field, ": ", path)
     }
     if (anyNA(df$inference_eligible) || any(df$inference_eligible) || any(!is.na(df$p_value)) || any(!is.na(df$q_value)) ||
-        any(!is.na(df$neutrality_rejected)) || any(df$calibration_status != "pending_refit_calibration") ||
+        any(!is.na(df$neutrality_rejected)) || anyNA(df$calibration_status) ||
+        length(unique(df$calibration_status)) != 1L ||
+        any(!df$calibration_status %in% c("pending_refit_calibration", "deferred_by_user")) ||
         any(df$check_method != "plugin_endpoint_check_v2")) {
       stop("Plug-in endpoint summaries cannot be promoted as calibrated inference: ", path)
     }
@@ -901,6 +932,7 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
   if (anyDuplicated(out$physical_interval_id) || !setequal(out$physical_interval_id, roster$physical_interval_id)) {
     stop("Published interval summaries must equal the complete native physical roster exactly once.")
   }
+  if (length(unique(out$calibration_status)) != 1L) stop("Mixed calibration policies in interval summary publication.")
   for (field in intersect(c("passaging_ontology_run_id", "passaging_ontology_manifest_sha256"), names(out))) {
     if (anyNA(out[[field]]) || length(unique(out[[field]])) != 1L) stop("Mixed ontology provenance in interval summary publication: ", field)
   }
@@ -933,10 +965,10 @@ write_neutral_probability_csv <- function(summary_dir = forward_validation_defau
                                           grouped_intervals_path = "core_data/grouped_intervals.Rds",
                                           output_path = forward_validation_default_paths(fit_mode)$aggregate_output_path,
                                           summary_pattern = "^forward_validation_.*_summary[.]Rds$",
-                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  if (fit_mode == "interval_shared_wgd_v1") {
-    return(write_interval_neutral_probability_csv(summary_dir, grouped_intervals_path, output_path, summary_pattern))
+  if (fit_mode != "pooled_group_v1") {
+    return(write_interval_neutral_probability_csv(summary_dir, grouped_intervals_path, output_path, summary_pattern, fit_mode))
   }
   out_cols <- c(
     "condition", "replicate_id", "ancestor", "p_value", "cin_rate", "delta_pass",

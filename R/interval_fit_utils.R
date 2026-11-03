@@ -190,12 +190,48 @@ nk_interval_grid_content_hash <- function(grid) {
   nk_fit_hash(stats::setNames(lapply(names(out), function(name) out[[name]]), names(out)))
 }
 
-# Every interval surface remains reusable when another interval changes. Group
-# profile checkpoints below depend on the complete sorted roster of surfaces.
+# A complete surface is independent of the selection policy. Authenticate a
+# prior surface before reuse; historical shared-WGD selected fits are never
+# relabeled as independently fitted pairs.
+nk_interval_reusable_surface <- function(grid, physical_interval_id, input_sha256, settings) {
+  if (is.null(grid)) return(NULL)
+  old_settings <- attr(grid, "settings")
+  source_settings <- attr(grid, "surface_settings")
+  source_schema <- attr(grid, "surface_schema")
+  if (is.null(source_settings)) {
+    source_settings <- old_settings
+    source_schema <- "neutral_interval_grid_checkpoint_v1"
+  }
+  if (is.null(old_settings) || is.null(source_settings) || is.null(source_schema) ||
+      !identical(old_settings$model_sha256, nk_fit_hash(attr(grid, "model_identity"))) ||
+      !identical(old_settings$runtime_sha256, nk_fit_hash(attr(grid, "runtime_identity")))) {
+    stop("Reusable interval grid lacks authenticated model/runtime metadata.")
+  }
+  part <- grid[grid$physical_interval_id == physical_interval_id, , drop = FALSE]
+  if (!nrow(part)) return(NULL)
+  identity <- list(schema = source_schema, physical_interval_id = physical_interval_id,
+                   semantic_input_sha256 = part$semantic_input_sha256[1L], settings = source_settings)
+  if (!identical(part$interval_grid_id[1L], paste0("nkig_", nk_fit_hash(identity)))) stop("Reusable interval surface identity checksum mismatch.")
+  scientific <- c("pmis_grid", "pwgd_grid", "model_sha256", "runtime_sha256")
+  if (!identical(old_settings[scientific], settings[scientific]) ||
+      !identical(part$semantic_input_sha256[1L], input_sha256)) return(NULL)
+  part <- part[order(part$pwgd, part$pmis), , drop = FALSE]
+  data <- data.frame(pmis = part$pmis, pwgd = part$pwgd, negll = part$negll)
+  list(data = data, source_interval_grid_id = part$interval_grid_id[1L])
+}
+
+# Every interval surface remains reusable when another interval changes. The
+# historical shared mode alone couples the subsequent group profile reduction.
 nk_interval_fit_grid <- function(grouped_intervals,
                                  pmis_grid = 10^(seq(-8, -1, length.out = 19)),
                                  pwgd_grid = c(0, 0.001, 0.01, 0.05),
-                                 checkpoint_dir = NULL, states = 0:8, eps = 1e-9) {
+                                 checkpoint_dir = NULL, states = 0:8, eps = 1e-9,
+                                 fit_mode = "interval_shared_wgd_v1", reuse_grid = NULL) {
+  fit_mode <- match.arg(fit_mode, c("interval_shared_wgd_v1", "interval_independent_v1"))
+  if (!is.null(reuse_grid)) {
+    if (is.null(attr(reuse_grid, "grid_sha256"))) stop("Reusable interval grid requires its content checksum.")
+    nk_interval_grid_validate(reuse_grid)
+  }
   roster <- nk_interval_roster(grouped_intervals)
   for (x in list(pmis_grid, pwgd_grid)) {
     if (!is.numeric(x) || !length(x) || any(!is.finite(x)) || any(x < 0) || anyDuplicated(x)) stop("Parameter grids require unique finite nonnegative values.")
@@ -212,16 +248,21 @@ nk_interval_fit_grid <- function(grouped_intervals,
   params <- expand.grid(pmis = pmis_grid, pwgd = pwgd_grid, KEEP.OUT.ATTRS = FALSE)
   model <- nk_interval_model_identity(states, eps)
   runtime <- nk_interval_runtime_identity()
-  settings <- list(fit_mode = "interval_shared_wgd_v1", pmis_grid = pmis_grid, pwgd_grid = pwgd_grid,
+  settings <- list(fit_mode = fit_mode, pmis_grid = pmis_grid, pwgd_grid = pwgd_grid,
                    model_sha256 = nk_fit_hash(model), runtime_sha256 = nk_fit_hash(runtime))
+  independent <- identical(fit_mode, "interval_independent_v1")
+  surface_settings <- if (independent) settings[setdiff(names(settings), "fit_mode")] else settings
+  surface_schema <- if (independent) "neutral_interval_grid_checkpoint_v2" else "neutral_interval_grid_checkpoint_v1"
   cache <- list()
   rows <- lapply(seq_len(nrow(roster)), function(i) {
     row <- roster[i, , drop = FALSE]
     interval <- grouped_intervals[[row$group_id]][[row$interval_idx]]
     input <- nk_interval_semantic_input(interval)
-    identity <- list(schema = "neutral_interval_grid_checkpoint_v1", physical_interval_id = row$physical_interval_id,
-                     semantic_input_sha256 = nk_fit_hash(input), settings = settings)
+    identity <- list(schema = surface_schema, physical_interval_id = row$physical_interval_id,
+                     semantic_input_sha256 = nk_fit_hash(input), settings = surface_settings)
+    reused_surface <- nk_interval_reusable_surface(reuse_grid, row$physical_interval_id, identity$semantic_input_sha256, settings)
     saved <- nk_fit_checkpoint(identity, function() {
+      if (!is.null(reused_surface)) return(reused_surface$data)
       out <- params
       out$negll <- vapply(seq_len(nrow(params)), function(j) {
         get_interval_nll_markov(p_mis = params$pmis[j], p_wgd = params$pwgd[j],
@@ -231,7 +272,10 @@ nk_interval_fit_grid <- function(grouped_intervals,
     }, checkpoint_dir)
     cache[[i]] <<- data.frame(physical_interval_id = row$physical_interval_id, interval_grid_id = paste0("nkig_", saved$sha256),
                               semantic_input_sha256 = identity$semantic_input_sha256,
-                              checkpoint_path = saved$checkpoint_path, cache_status = saved$cache_status)
+                              checkpoint_path = saved$checkpoint_path,
+                              cache_status = if (!is.null(reused_surface)) "reused" else saved$cache_status,
+                              reuse_kind = if (saved$cache_status == "reused") "checkpoint" else if (!is.null(reused_surface)) "authenticated_surface" else "computed",
+                              source_interval_grid_id = if (!is.null(reused_surface)) reused_surface$source_interval_grid_id else NA_character_)
     out <- saved$data
     out$physical_interval_id <- row$physical_interval_id
     out$group_id <- row$group_id
@@ -241,7 +285,7 @@ nk_interval_fit_grid <- function(grouped_intervals,
     out$n_start_cells <- row$n_start_cells
     out$n_end_cells <- row$n_end_cells
     out$n_divisions <- row$n_divisions
-    out$fit_mode <- "interval_shared_wgd_v1"
+    out$fit_mode <- fit_mode
     out$fit_schema <- "neutral_interval_grid_v1"
     out
   })
@@ -249,6 +293,8 @@ nk_interval_fit_grid <- function(grouped_intervals,
   rownames(out) <- NULL
   attr(out, "roster") <- roster
   attr(out, "settings") <- settings
+  attr(out, "surface_settings") <- surface_settings
+  attr(out, "surface_schema") <- surface_schema
   attr(out, "model_identity") <- model
   attr(out, "runtime_identity") <- runtime
   attr(out, "interval_checkpoints") <- do.call(rbind, cache)
@@ -262,7 +308,8 @@ nk_interval_grid_validate <- function(grid) {
                 "n_start_cells", "n_end_cells", "n_divisions", "fit_mode", "fit_schema")
   if (!is.data.frame(grid) || !nrow(grid) || !all(required %in% names(grid)) ||
       anyNA(grid[c("physical_interval_id", "group_id", "interval_grid_id", "pmis", "pwgd")]) ||
-      !all(grid$fit_mode == "interval_shared_wgd_v1") || !all(grid$fit_schema == "neutral_interval_grid_v1")) {
+      length(unique(grid$fit_mode)) != 1L || !all(grid$fit_mode %in% c("interval_shared_wgd_v1", "interval_independent_v1")) ||
+      !all(grid$fit_schema == "neutral_interval_grid_v1")) {
     stop("Expected a versioned interval likelihood grid; pooled fits cannot be used as interval fits.")
   }
   if (!is.numeric(grid$negll) || any(!is.finite(grid$pmis)) || any(!is.finite(grid$pwgd)) ||
@@ -338,11 +385,111 @@ nk_interval_reduce_group <- function(data) {
        conditional_interval_profiles = interval_profiles, pmis_profiles = pmis_profiles)
 }
 
+nk_interval_reduce_independent <- function(data) {
+  ids <- unique(data$physical_interval_id)
+  if (length(ids) != 1L) stop("Independent reduction requires exactly one physical interval.")
+  data <- data[order(data$pwgd, data$pmis), , drop = FALSE]
+  p <- sort(unique(data$pmis))
+  q <- sort(unique(data$pwgd))
+  values <- data$negll
+  values[!is.finite(values)] <- Inf
+  surface <- matrix(values, nrow = length(p), ncol = length(q))
+  optimum <- min(values)
+  # The column-major order is ascending q, then ascending p, including ties.
+  best <- if (is.finite(optimum)) which(surface == optimum, arr.ind = TRUE) else matrix(integer(), ncol = 2L)
+  p_index <- if (nrow(best)) best[1L, 1L] else NA_integer_
+  q_index <- if (nrow(best)) best[1L, 2L] else NA_integer_
+  p_profile <- apply(surface, 1L, min)
+  q_profile <- apply(surface, 2L, min)
+  conditional <- if (nrow(best)) surface[, q_index] else rep(Inf, length(p))
+  p_ties <- if (nrow(best)) sum(conditional == optimum) else 0L
+  q_ties <- if (nrow(best)) sum(q_profile == optimum) else 0L
+  profile <- function(parameter, objective, index) {
+    out <- data.frame(physical_interval_id = ids, value = parameter, negll = objective,
+                      delta_negll = if (is.finite(optimum)) objective - optimum else NA_real_,
+                      is_minimum = is.finite(objective) & objective == optimum,
+                      is_selected = seq_along(parameter) == index, stringsAsFactors = FALSE)
+    out$is_selected[is.na(out$is_selected)] <- FALSE
+    out
+  }
+  pmis_profile <- profile(p, p_profile, p_index)
+  names(pmis_profile)[2L] <- "pmis"
+  pwgd_profile <- profile(q, q_profile, q_index)
+  names(pwgd_profile)[2L] <- "pwgd"
+  selected <- data.frame(physical_interval_id = ids,
+    pmis = if (nrow(best)) p[p_index] else NA_real_,
+    pwgd = if (nrow(best)) q[q_index] else NA_real_, negll = optimum,
+    group_negll = NA_real_, joint_tie_count = nrow(best),
+    pmis_tie_count = p_ties, pwgd_tie_count = q_ties,
+    pmis_tied = p_ties > 1L, pwgd_tied = q_ties > 1L,
+    pmis_flat = p_ties > 1L && p_ties == length(p),
+    pwgd_flat = q_ties > 1L && q_ties == length(q),
+    pmis_profile_tie_count = sum(pmis_profile$is_minimum),
+    pmis_profile_flat = length(p) > 1L && all(pmis_profile$is_minimum),
+    pmis_grid_singleton = length(p) == 1L, pwgd_grid_singleton = length(q) == 1L,
+    pmis_at_lower_bound = !is.na(p_index) && p_index == 1L,
+    pmis_at_upper_bound = !is.na(p_index) && p_index == length(p),
+    pwgd_at_lower_bound = !is.na(q_index) && q_index == 1L,
+    pwgd_at_upper_bound = !is.na(q_index) && q_index == length(q),
+    n_finite_grid_points = sum(is.finite(values)),
+    estimability_status = if (!nrow(best)) "no_finite_interval_grid" else if (nrow(best) > 1L) "tied_grid_optimum" else "unique_grid_optimum",
+    uncertainty_status = "not_calibrated", stringsAsFactors = FALSE)
+  list(selected = selected, pmis_profiles = pmis_profile, pwgd_profiles = pwgd_profile)
+}
+
+nk_interval_independent_fit_id <- function(fits, i) {
+  paste0("nkif_", nk_fit_hash(list(fit_mode = fits$fit_mode[i],
+    physical_interval_id = fits$physical_interval_id[i], interval_grid_id = fits$interval_grid_id[i],
+    interval_profile_id = fits$interval_profile_id[i], fit_dependency_id = fits$fit_dependency_id[i],
+    tie_policy = fits$tie_policy[i], pmis = fits$pmis[i], pwgd = fits$pwgd[i], negll = fits$negll[i])))
+}
+
+nk_select_independent_interval_fits <- function(grid, checkpoint_dir) {
+  profiles <- list()
+  caches <- list()
+  result <- lapply(sort(unique(grid$physical_interval_id), method = "radix"), function(id) {
+    data <- grid[grid$physical_interval_id == id, , drop = FALSE]
+    data <- data[order(data$pwgd, data$pmis), , drop = FALSE]
+    core_names <- c("physical_interval_id", "interval_grid_id", "pmis", "pwgd", "negll")
+    core <- as.data.frame(stats::setNames(lapply(core_names, function(name) data[[name]]), core_names), stringsAsFactors = FALSE)
+    identity <- list(schema = "neutral_independent_interval_profile_checkpoint_v1",
+                     surface_sha256 = nk_fit_hash(core), fit_mode = "interval_independent_v1",
+                     tie_policy = "exact_minimum_lowest_pwgd_then_pmis_v1",
+                     reduction_sha256 = nk_fit_hash(list(formals(nk_interval_reduce_independent), body(nk_interval_reduce_independent))))
+    saved <- nk_fit_checkpoint(identity, function() nk_interval_reduce_independent(core), checkpoint_dir, "interval_profiles")
+    profile_id <- paste0("nkip_", saved$sha256)
+    profiles[[id]] <<- saved$data[c("pmis_profiles", "pwgd_profiles")]
+    caches[[id]] <<- data.frame(physical_interval_id = id, interval_profile_id = profile_id,
+                                checkpoint_path = saved$checkpoint_path, cache_status = saved$cache_status)
+    out <- saved$data$selected
+    for (name in c("group_id", "interval_idx", "interval_grid_id", "semantic_input_sha256", "n_start_cells", "n_end_cells", "n_divisions")) out[[name]] <- data[[name]][1L]
+    out$interval_profile_id <- profile_id
+    out$group_profile_id <- NA_character_
+    out$fit_schema <- "neutral_interval_fit_v1"
+    out$fit_mode <- "interval_independent_v1"
+    out$fit_scope <- "physical_interval"
+    out$wgd_scope <- "physical_interval"
+    out$tie_policy <- identity$tie_policy
+    out$fit_dependency_id <- paste0("nkdep_", nk_fit_hash(list(fit_mode = out$fit_mode,
+      physical_interval_id = id, interval_grid_id = out$interval_grid_id,
+      interval_profile_id = profile_id, tie_policy = out$tie_policy)))
+    out$fit_id <- nk_interval_independent_fit_id(out, 1L)
+    out
+  })
+  out <- do.call(rbind, result)
+  rownames(out) <- NULL
+  attr(out, "profiles") <- profiles
+  attr(out, "profile_checkpoints") <- do.call(rbind, caches)
+  for (name in c("interval_checkpoints", "roster", "settings", "model_identity", "runtime_identity")) attr(out, name) <- attr(grid, name)
+  nk_validate_interval_fits(out)
+}
+
 nk_select_interval_fits <- function(grid, checkpoint_dir = attr(grid, "checkpoint_dir")) {
   if (is.data.frame(grid) && "fit_schema" %in% names(grid) && all(grid$fit_schema == "neutral_interval_fit_v1")) {
     return(nk_validate_interval_fits(grid))
   }
   nk_interval_grid_validate(grid)
+  if (identical(unique(grid$fit_mode), "interval_independent_v1")) return(nk_select_independent_interval_fits(grid, checkpoint_dir))
   profiles <- list()
   caches <- list()
   result <- lapply(sort(unique(grid$group_id), method = "radix"), function(group) {
@@ -390,19 +537,37 @@ nk_validate_interval_fits <- function(fits, grouped_intervals = NULL) {
   required <- c("physical_interval_id", "group_id", "interval_idx", "pmis", "pwgd", "negll", "fit_id",
                 "interval_grid_id", "semantic_input_sha256", "group_profile_id", "fit_schema", "fit_mode", "fit_scope", "wgd_scope", "tie_policy", "estimability_status")
   if (!is.data.frame(fits) || !nrow(fits) || !all(required %in% names(fits)) ||
-      anyNA(fits[c("physical_interval_id", "group_id", "fit_id", "interval_grid_id", "group_profile_id")]) ||
+      anyNA(fits[c("physical_interval_id", "group_id", "fit_id", "interval_grid_id", "semantic_input_sha256", "fit_mode")]) ||
       anyDuplicated(fits$physical_interval_id) || anyDuplicated(fits$fit_id) ||
-      !all(fits$fit_schema == "neutral_interval_fit_v1") || !all(fits$fit_mode == "interval_shared_wgd_v1") ||
-      !all(fits$fit_scope == "physical_interval") || !all(fits$wgd_scope == "group_shared_profile") ||
+      !all(fits$fit_schema == "neutral_interval_fit_v1") || length(unique(fits$fit_mode)) != 1L ||
+      !all(fits$fit_mode %in% c("interval_shared_wgd_v1", "interval_independent_v1")) ||
+      !all(fits$fit_scope == "physical_interval") ||
       !all(fits$tie_policy == "exact_minimum_lowest_pwgd_then_pmis_v1")) stop("Invalid or duplicate selected interval fit contract.")
-  for (group in unique(fits$group_id)) {
-    x <- fits[fits$group_id == group, , drop = FALSE]
-    if (length(unique(x$pwgd)) != 1L || length(unique(x$group_profile_id)) != 1L) stop("Conflicting shared WGD fit within group: ", group)
+  independent <- identical(unique(fits$fit_mode), "interval_independent_v1")
+  if (independent) {
+    if (!all(c("interval_profile_id", "fit_dependency_id", "joint_tie_count") %in% names(fits)) ||
+        anyNA(fits[c("interval_profile_id", "fit_dependency_id", "joint_tie_count")]) ||
+        !all(fits$wgd_scope == "physical_interval") || !all(is.na(fits$group_profile_id)) ||
+        anyDuplicated(fits$interval_profile_id) || anyDuplicated(fits$fit_dependency_id)) stop("Invalid independent interval fit dependency contract.")
+    expected_dependency <- vapply(seq_len(nrow(fits)), function(i) paste0("nkdep_", nk_fit_hash(list(
+      fit_mode = fits$fit_mode[i], physical_interval_id = fits$physical_interval_id[i],
+      interval_grid_id = fits$interval_grid_id[i], interval_profile_id = fits$interval_profile_id[i],
+      tie_policy = fits$tie_policy[i]))), character(1))
+    if (!identical(fits$fit_dependency_id, expected_dependency)) stop("Independent interval fit dependency checksum mismatch.")
+  } else {
+    if (anyNA(fits$group_profile_id) || !all(fits$wgd_scope == "group_shared_profile")) stop("Invalid shared WGD fit dependency contract.")
+    for (group in unique(fits$group_id)) {
+      x <- fits[fits$group_id == group, , drop = FALSE]
+      if (length(unique(x$pwgd)) != 1L || length(unique(x$group_profile_id)) != 1L) stop("Conflicting shared WGD fit within group: ", group)
+    }
   }
   finite <- is.finite(fits$pmis) & is.finite(fits$pwgd) & is.finite(fits$negll)
-  unavailable <- fits$estimability_status == "no_finite_shared_wgd_profile"
+  unavailable_status <- if (independent) "no_finite_interval_grid" else "no_finite_shared_wgd_profile"
+  if (!all(fits$estimability_status %in% c("unique_grid_optimum", "tied_grid_optimum", unavailable_status))) stop("Unknown interval fit estimability status.")
+  unavailable <- fits$estimability_status == unavailable_status
   if (any(!finite & !unavailable) || any(finite & unavailable) || any(fits$pmis[finite] < 0 | fits$pwgd[finite] < 0)) stop("Interval fit estimability status conflicts with selected parameters.")
-  expected_ids <- vapply(seq_len(nrow(fits)), function(i) paste0("nkif_", nk_fit_hash(list(
+  expected_ids <- if (independent) vapply(seq_len(nrow(fits)), function(i) nk_interval_independent_fit_id(fits, i), character(1)) else
+    vapply(seq_len(nrow(fits)), function(i) paste0("nkif_", nk_fit_hash(list(
     physical_interval_id = fits$physical_interval_id[i], interval_grid_id = fits$interval_grid_id[i],
     group_profile_id = fits$group_profile_id[i], tie_policy = fits$tie_policy[i],
     pmis = fits$pmis[i], pwgd = fits$pwgd[i], negll = fits$negll[i]))), character(1))
