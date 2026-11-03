@@ -52,7 +52,7 @@ test_forward_default_routing <- function() {
     list(list())
   }
   route$summarize_forward_validation <- function(...) {
-    list(interval_summary = data.frame(), replicate_summary = data.frame(), calibration = list(status = "pending"))
+    list(interval_summary = data.frame(), replicate_summary = data.frame())
   }
   route$forward_checkpoint_atomic_save <- function(object, path, ...) saveRDS(object, path)
   route$write_neutral_probability_csv <- function(...) {
@@ -152,17 +152,25 @@ test_forward_default_routing <- function() {
     stopifnot(identical(single_cli$group_fit_path, defaults$group_fit_path), identical(single_cli$output_path, defaults$output_path),
               identical(single_cli$summary_output_path, forward_validation_summary_path(defaults$output_path, mode)),
               identical(single_cli$update_aggregate, mode == "pooled_group_v1"),
-              identical(single_cli$calibration_status, "pending_refit_calibration"),
+              !"calibration_status" %in% names(single_cli),
               identical(all_cli$group_fit_path, defaults$group_fit_path), identical(all_cli$output_dir, defaults$output_dir),
               identical(all_cli$summary_output_dir, defaults$summary_output_dir), identical(all_cli$aggregate_output_path, defaults$aggregate_output_path))
   }
-  single_cli <- capture_cli("scripts/run_forward_validation.R", c(paste0("--fit_mode=", new_mode), "--forward_group_id=group_a", "--group_fit_path=custom/fit.Rds", "--output_path=custom/run.Rds", "--summary_output_path=custom/summary.Rds", "--checkpoint_dir=custom/checkpoints", "--calibration_status=deferred_by_user"), "run_forward_validation_main")
-  all_cli <- capture_cli("scripts/run_forward_validation_all.R", c(paste0("--fit_mode=", new_mode), "--group_fit_path=custom/fit.Rds", "--output_dir=custom/results", "--summary_output_dir=custom/summaries", "--aggregate_output_path=custom/diagnostics.csv", "--calibration_status=deferred_by_user"), "run_forward_validation_all_main")
+  single_cli <- capture_cli("scripts/run_forward_validation.R", c(paste0("--fit_mode=", new_mode), "--forward_group_id=group_a", "--group_fit_path=custom/fit.Rds", "--output_path=custom/run.Rds", "--summary_output_path=custom/summary.Rds", "--checkpoint_dir=custom/checkpoints"), "run_forward_validation_main")
+  all_cli <- capture_cli("scripts/run_forward_validation_all.R", c(paste0("--fit_mode=", new_mode), "--group_fit_path=custom/fit.Rds", "--output_dir=custom/results", "--summary_output_dir=custom/summaries", "--aggregate_output_path=custom/diagnostics.csv"), "run_forward_validation_all_main")
   stopifnot(identical(single_cli$group_fit_path, "custom/fit.Rds"), identical(single_cli$output_path, "custom/run.Rds"),
             identical(single_cli$summary_output_path, "custom/summary.Rds"), identical(single_cli$checkpoint_dir, "custom/checkpoints"),
-            identical(single_cli$calibration_status, "deferred_by_user"), identical(all_cli$calibration_status, "deferred_by_user"),
             identical(all_cli$group_fit_path, "custom/fit.Rds"), identical(all_cli$output_dir, "custom/results"),
             identical(all_cli$summary_output_dir, "custom/summaries"), identical(all_cli$aggregate_output_path, "custom/diagnostics.csv"))
+  # Capture the approved production arguments without launching simulations.
+  production <- c("--fit_mode=interval_independent_v1", "--bottleneck_size=3000", "--expansion_factor=32",
+                  "--record_every=50", "--n_reps=200", "--n_null_pairs=1000", "--distance_metric=wasserstein")
+  single_production <- capture_cli("scripts/run_forward_validation.R", c(production, "--forward_group_id=group_a"), "run_forward_validation_main")
+  all_production <- capture_cli("scripts/run_forward_validation_all.R", production, "run_forward_validation_all_main")
+  fields <- c("bottleneck_size", "expansion_factor", "record_every", "n_reps", "n_null_pairs", "distance_metric")
+  expected_settings <- list(bottleneck_size = 3000L, expansion_factor = 32L, record_every = 50L,
+                            n_reps = 200L, n_null_pairs = 1000L, distance_metric = "wasserstein")
+  stopifnot(identical(single_production[fields], expected_settings), identical(all_production[fields], expected_settings))
   message("PASS: interval function/loader/CLI/writer defaults preserve pooled artifacts; explicit paths and pooled defaults remain unchanged.")
 }
 
@@ -224,33 +232,46 @@ test_independent_forward_contract <- function() {
     stopifnot(all(vapply(independent_runs[[i]], function(x) identical(x$p_mis, fits$pmis[i]) && identical(x$p_wgd, fits$pwgd[i]), logical(1))))
   }
   expect_error(run(shared), "requested fit mode")
-  summary <- function(runs, selected, grouped = groups, calibration_status = "pending_refit_calibration") summarize_forward_validation(
+  summary <- function(runs, selected, grouped = groups) summarize_forward_validation(
     runs, grouped[[1L]], names(grouped)[1L], n_null_pairs = 2L, distance_metric = "wasserstein",
-    fit_mode = mode, fit_rows = selected, seed_roster = seeds, checkpoint_dir = raw_root, calibration_status = calibration_status)
-  pending <- summary(independent_runs, fits)
-  deferred <- summary(independent_runs, fits, calibration_status = "deferred_by_user")
-  stopifnot(all(deferred$interval_summary$calibration_status == "deferred_by_user"),
-            identical(deferred$calibration$status, "deferred_by_user"),
-            all(is.na(deferred$interval_summary$p_value)), all(is.na(deferred$interval_summary$q_value)),
-            all(!deferred$interval_summary$inference_eligible),
-            all(vapply(deferred$interval_checks, function(x) isTRUE(attr(x, "checkpoint_reused")), logical(1))))
+    fit_mode = mode, fit_rows = selected, seed_roster = seeds, checkpoint_dir = raw_root)
+  checked <- summary(independent_runs, fits)
+  resumed <- summary(independent_runs, fits)
+  stopifnot(all(resumed$interval_summary$check_method == "posterior_predictive_check_v1"),
+            identical(resumed$interval_summary$p_value, resumed$interval_summary$posterior_predictive_p),
+            all(is.finite(resumed$interval_summary$p_value)),
+            !any(c("calibration_status", "inference_eligible", "diagnostic_p", "q_value", "neutrality_rejected") %in% names(resumed$interval_summary)),
+            !"calibration" %in% names(resumed),
+            all(vapply(resumed$interval_checks, function(x) isTRUE(attr(x, "checkpoint_reused")), logical(1))))
+  for (i in seq_along(independent_runs)) {
+    direct <- posterior_predictive_endpoint_check(groups[[1L]][[i]]$end_karyotype,
+      lapply(independent_runs[[i]], `[[`, "final_matrix"), n_pairs = 2L, distance_metric = "wasserstein",
+      subsample_seeds = forward_rng_lookup(seeds, ids[i], "endpoint_subsample", seq_along(independent_runs[[i]])),
+      null_pair_seed = forward_rng_lookup(seeds, ids[i], "endpoint_null_pairs", 0L))
+    actual <- checked$interval_checks[[i]]
+    stopifnot(identical(actual$observed_distances, direct$observed_distances),
+              identical(actual$null_distances, direct$null_distances),
+              checked$interval_summary$test_wasserstein[i] == median(direct$observed_distances),
+              checked$interval_summary$p_value[i] == mean(direct$null_distances >= median(direct$observed_distances)))
+  }
   changed_groups <- groups
   changed_groups$group_a[[2L]]$end_karyotype[2L, 1L] <- 4
   changed_fits <- fit(changed_groups)
   changed_runs <- run(changed_fits, changed_groups)
   changed_summary <- summary(changed_runs, changed_fits, changed_groups)
   stopifnot(all(attr(changed_runs, "checkpoint_receipts")$reused),
-            identical(pending$calibration$interval_dependency_sha256[ids[1L]], changed_summary$calibration$interval_dependency_sha256[ids[1L]]))
+            identical(checked$interval_summary$fit_dependency_id[1L], changed_summary$interval_summary$fit_dependency_id[1L]),
+            isTRUE(attr(changed_summary$interval_checks[[1L]], "checkpoint_reused")))
   summary_dir <- file.path(test_root, "summaries")
   dir.create(summary_dir)
   grouped_path <- file.path(test_root, "groups.Rds")
   saveRDS(groups, grouped_path)
-  result <- list(forward_group_id = "group_a", fit_row = fits, settings = list(fit_mode = mode, calibration_status = "deferred_by_user"),
-                 forward_validation = deferred, seed_roster = seeds)
+  result <- list(forward_group_id = "group_a", fit_row = fits, settings = list(fit_mode = mode, check_method = "posterior_predictive_check_v1"),
+                 forward_validation = resumed, seed_roster = seeds)
   saveRDS(forward_validation_summary_object(result), file.path(summary_dir, "forward_validation_group_a_summary.Rds"))
   csv <- write_neutral_probability_csv(summary_dir, grouped_path, file.path(test_root, "diagnostics.csv"), fit_mode = mode)
-  stopifnot(setequal(csv$pwgd, c(0, 0.02)), all(csv$calibration_status == "deferred_by_user"),
-            all(is.na(csv$p_value)), all(is.na(csv$q_value)))
+  stopifnot(setequal(csv$pwgd, c(0, 0.02)), all(csv$check_method == "posterior_predictive_check_v1"),
+            all(is.finite(csv$p_value)), identical(csv$p_value, csv$posterior_predictive_p))
   expect_error(write_neutral_probability_csv(summary_dir, grouped_path, file.path(test_root, "wrong_mode.csv"), fit_mode = "interval_shared_wgd_v1"), "rejects legacy, mixed")
   unavailable_groups <- groups
   unavailable_groups$group_a[[2L]]$end_karyotype[1L, 1L] <- 5
@@ -258,13 +279,14 @@ test_independent_forward_contract <- function() {
   unavailable_runs <- run(unavailable_fits, unavailable_groups)
   unavailable_summary <- summary(unavailable_runs, unavailable_fits, unavailable_groups)
   stopifnot(length(unavailable_runs[[1L]]) == 3L, length(unavailable_runs[[2L]]) == 0L,
-            unavailable_summary$interval_summary$forward_status[2L] == "not_simulated_non_estimable_fit")
-  message("PASS: independent interval p/q pairs, matching raw-task reuse, isolated dependencies, mixed estimability and explicit deferred calibration policy.")
+            unavailable_summary$interval_summary$forward_status[2L] == "not_simulated_non_estimable_fit",
+            is.finite(unavailable_summary$interval_summary$p_value[1L]), is.na(unavailable_summary$interval_summary$p_value[2L]))
+  message("PASS: independent own-pair dispatch, original posterior-predictive algebra, checkpoint reuse and explicit mixed estimability.")
 }
 
 test_independent_forward_contract()
 if ("--independent-only" %in% commandArgs(trailingOnly = TRUE)) {
-  message("Focused independent forward/policy tests passed; production and simulator suites were not repeated.")
+  message("Focused independent forward contract tests passed; no production or statistical validation was run.")
   quit(status = 0L)
 }
 groups <- list(group_a = list(fixture("physical_end_a"), fixture("physical_end_b", 3)))
@@ -394,14 +416,13 @@ summarize_fixture <- function(runs, grouped = groups, selected = fit_groups(grou
 summary <- summarize_fixture(baseline)
 summary_again <- summarize_fixture(baseline)
 stopifnot(all(vapply(summary_again$interval_checks, function(x) isTRUE(attr(x, "checkpoint_reused")), logical(1))),
-          all(!summary$interval_summary$inference_eligible), all(is.na(summary$interval_summary$p_value)),
-          all(is.na(summary$interval_summary$q_value)), all(summary$interval_summary$calibration_status == "pending_refit_calibration"))
+          identical(summary$interval_summary$p_value, summary$interval_summary$posterior_predictive_p),
+          all(summary$interval_summary$check_method == "posterior_predictive_check_v1"))
 reordered_summary <- summarize_fixture(reordered, reordered_groups, fits[2:1, , drop = FALSE])
 by_id <- function(df) { out <- df[order(df$physical_interval_id), setdiff(names(df), "interval_idx"), drop = FALSE]; rownames(out) <- NULL; out }
-stopifnot(identical(by_id(summary$interval_summary), by_id(reordered_summary$interval_summary)),
-          identical(summary$calibration$identity_sha256, reordered_summary$calibration$identity_sha256))
+stopifnot(identical(by_id(summary$interval_summary), by_id(reordered_summary$interval_summary)))
 profile_summary <- summarize_fixture(profile_only, profile_groups, profile_fits)
-stopifnot(!identical(summary$calibration$identity_sha256, profile_summary$calibration$identity_sha256))
+stopifnot(!identical(summary$interval_summary$fit_id, profile_summary$interval_summary$fit_id))
 changed_check <- summarize_fixture(baseline, n_pairs = 1L)
 stopifnot(all(!vapply(changed_check$interval_checks, function(x) isTRUE(attr(x, "checkpoint_reused")), logical(1))))
 extinct <- without_receipts(baseline)
@@ -409,7 +430,7 @@ extinct[[1L]][[2L]]$final_matrix <- matrix(numeric(), nrow = 0L, ncol = 2L)
 extinct_summary <- summarize_fixture(extinct)
 stopifnot(identical(extinct_summary$interval_checks[[1L]]$simulation_rep_indices, c(1L, 3L)),
           setequal(extinct_summary$ploidy$rep_idx[extinct_summary$ploidy$interval_idx == 1L & extinct_summary$ploidy$type == "simulated_matched"], c(1L, 3L)))
-message("PASS: plug-in checks cache independently, reorder deterministically, and retain pending coupled calibration.")
+message("PASS: posterior-predictive checks cache independently and reorder deterministically.")
 
 summary_dir <- file.path(test_root, "summaries")
 dir.create(summary_dir)
@@ -421,7 +442,7 @@ saveRDS(forward_validation_summary_object(result), summary_path)
 csv <- write_neutral_probability_csv(summary_dir, file.path(test_root, "groups.Rds"), file.path(test_root, "summary.csv"), fit_mode = "interval_shared_wgd_v1")
 idx <- match(csv$physical_interval_id, fits$physical_interval_id)
 stopifnot(identical(csv$cin_rate, fits$pmis[idx]), identical(csv$fit_id, fits$fit_id[idx]),
-          all(is.na(csv$p_value)), all(is.na(csv$q_value)), !any(csv$inference_eligible))
+          identical(csv$p_value, csv$posterior_predictive_p), all(csv$check_method == "posterior_predictive_check_v1"))
 expect_error(write_neutral_probability_csv(summary_dir, file.path(test_root, "groups.Rds"), file.path(test_root, "legacy.csv")), "cannot consume")
 expect_error(select_best_group_fits(fits), "cannot consume")
 bad_summary <- forward_validation_summary_object(result)
@@ -431,11 +452,11 @@ expect_error(write_neutral_probability_csv(summary_dir, file.path(test_root, "gr
 bad_summary <- forward_validation_summary_object(result)
 bad_summary$interval_summary$p_value[1L] <- 0.01
 saveRDS(bad_summary, summary_path)
-expect_error(write_neutral_probability_csv(summary_dir, file.path(test_root, "groups.Rds"), file.path(test_root, "bad.csv"), fit_mode = "interval_shared_wgd_v1"), "cannot be promoted")
+expect_error(write_neutral_probability_csv(summary_dir, file.path(test_root, "groups.Rds"), file.path(test_root, "bad.csv"), fit_mode = "interval_shared_wgd_v1"), "must preserve")
 saveRDS(forward_validation_summary_object(result), summary_path)
 saveRDS(forward_validation_summary_object(result), file.path(summary_dir, "forward_validation_duplicate_summary.Rds"))
 expect_error(write_neutral_probability_csv(summary_dir, file.path(test_root, "groups.Rds"), file.path(test_root, "bad.csv"), fit_mode = "interval_shared_wgd_v1"), "exactly once")
-message("PASS: interval CSV exports exact fit identities/parameters, rejects mixed/stale rows and blocks inferential promotion.")
+message("PASS: interval CSV preserves original p-values and exact fit identities, rejecting mixed/stale rows.")
 
 ploidy <- build_ploidy_diagnostics(groups, fits, fit_mode = "interval_shared_wgd_v1")
 marginal <- build_marginal_cn_diagnostics(groups, fits, fit_mode = "interval_shared_wgd_v1")
@@ -452,8 +473,14 @@ unavailable <- fit_groups(groups)
 unavailable_summary <- summarize_fixture(list(list(), list()), selected = unavailable)
 stopifnot(nrow(unavailable_summary$interval_summary) == 2L,
           all(unavailable_summary$interval_summary$forward_status == "not_simulated_non_estimable_fit"),
-          all(is.na(unavailable_summary$interval_summary$diagnostic_p)))
+          all(is.na(unavailable_summary$interval_summary$posterior_predictive_p)))
 message("PASS: non-estimable fits retain complete interval accounting without invented simulations.")
+
+if ("--contracts-only" %in% commandArgs(trailingOnly = TRUE)) {
+  unlink(test_root, recursive = TRUE)
+  message("Focused synthetic algebra/dispatch/parity/resume checks passed; simulator and production runs were skipped.")
+  quit(status = 0L)
+}
 
 # One real simulator smoke is small enough for an interactive test. Separate
 # roots exercise worker-count invariance; every population is only four cells.
@@ -485,7 +512,8 @@ rerun <- load_forward_validation_result("group_a", file.path(test_root, "groups.
                                         n_reps = 2L, record_every = 1L, n_null_pairs = 2L, n_cores = 1L,
                                         seed = 17L, distance_metric = "wasserstein", fit_mode = "interval_shared_wgd_v1")
 stopifnot(identical(runner$settings$fit_mode, "interval_shared_wgd_v1"),
-          all(rerun$checkpoint_receipts$reused), all(is.na(rerun$forward_validation$interval_summary$p_value)))
+          all(rerun$checkpoint_receipts$reused),
+          identical(rerun$forward_validation$interval_summary$p_value, rerun$forward_validation$interval_summary$posterior_predictive_p))
 message("PASS: runner and cache loader use strict interval mode and resume raw simulations across check-setting changes.")
 
 all_groups <- c(groups, list(group_b = list(fixture("physical_end_c", 3))))
@@ -502,7 +530,7 @@ run_all <- function() run_forward_validation_all_main(
   aggregate_output_path = file.path(test_root, "all_diagnostics.csv"))
 all_paths <- run_all()
 first_all <- utils::read.csv(file.path(test_root, "all_diagnostics.csv"), stringsAsFactors = FALSE)
-stopifnot(length(all_paths) == 2L, nrow(first_all) == 3L, all(is.na(first_all$p_value)))
+stopifnot(length(all_paths) == 2L, nrow(first_all) == 3L, identical(first_all$p_value, first_all$posterior_predictive_p))
 saveRDS(list(group_b = all_groups$group_b, group_a = rev(all_groups$group_a)), all_group_path)
 saveRDS(all_fits[rev(seq_len(nrow(all_fits))), , drop = FALSE], all_fit_path)
 all_reordered_paths <- run_all()

@@ -17,7 +17,6 @@ forward_validation_summary_object <- function(forward_result) {
     replicate_summary = forward_result$forward_validation$replicate_summary
   )
   if (isTRUE(forward_result$settings$fit_mode %in% c("interval_shared_wgd_v1", "interval_independent_v1"))) {
-    out$calibration <- forward_result$forward_validation$calibration
     out$seed_roster <- forward_result$seed_roster
   }
   out
@@ -142,10 +141,8 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
                                         checkpoint_dir = NULL,
                                         checkpoint_batch_size = n_cores,
                                         update_aggregate = missing(summary_output_path),
-                                        fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
-                                        calibration_status = c("pending_refit_calibration", "deferred_by_user")) {
+                                        fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  calibration_status <- match.arg(calibration_status)
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("run_forward_validation_main() requires a non-empty `forward_group_id`.")
   }
@@ -209,8 +206,7 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     seed_base = if (fit_mode == "pooled_group_v1") as.integer(seed) * 10000L else as.integer(seed),
     distance_metric = distance_metric,
     fit_mode = fit_mode, fit_rows = fit_row, seed_roster = seed_roster,
-    checkpoint_dir = if (fit_mode != "pooled_group_v1") checkpoint_dir else NULL,
-    calibration_status = calibration_status
+    checkpoint_dir = if (fit_mode != "pooled_group_v1") checkpoint_dir else NULL
   )
   out <- list(
     forward_group_id = forward_group_id,
@@ -231,9 +227,7 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
   if (fit_mode != "pooled_group_v1") {
     out$settings$fit_mode <- fit_mode
     out$settings$summary_schema <- "neutral_interval_forward_summary_v1"
-    out$settings$check_method <- "plugin_endpoint_check_v2"
-    out$settings$calibration_status <- calibration_status
-    out$settings$inference_eligible <- FALSE
+    out$settings$check_method <- "posterior_predictive_check_v1"
     out$seed_roster <- seed_roster
   }
   if (!is.null(checkpoint_receipts)) out$checkpoint_receipts <- checkpoint_receipts
@@ -282,10 +276,8 @@ load_forward_validation_result <- function(forward_group_id,
                                            checkpoint_dir = NULL,
                                            checkpoint_batch_size = n_cores,
                                            update_aggregate = missing(summary_output_path),
-                                           fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
-                                           calibration_status = c("pending_refit_calibration", "deferred_by_user")) {
+                                           fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
-  calibration_status <- match.arg(calibration_status)
   if (fit_mode != "pooled_group_v1") {
     if (missing(update_aggregate)) update_aggregate <- FALSE
     if (missing(output_path)) output_path <- forward_validation_default_paths(fit_mode)$output_path
@@ -331,7 +323,7 @@ load_forward_validation_result <- function(forward_group_id,
       distance_metric = distance_metric,
       checkpoint_dir = checkpoint_dir,
       checkpoint_batch_size = checkpoint_batch_size,
-      update_aggregate = update_aggregate, fit_mode = fit_mode, calibration_status = calibration_status
+      update_aggregate = update_aggregate, fit_mode = fit_mode
     )
   }
 
@@ -343,7 +335,6 @@ if (sys.nframe() == 0L) {
     optparse::make_option("--grouped_intervals_path", type = "character", default = "core_data/grouped_intervals.Rds"),
     optparse::make_option("--group_fit_path", type = "character", default = NULL),
     optparse::make_option("--fit_mode", type = "character", default = "pooled_group_v1"),
-    optparse::make_option("--calibration_status", type = "character", default = "pending_refit_calibration"),
     optparse::make_option("--forward_group_id", type = "character", default = NULL),
     optparse::make_option("--output_path", type = "character", default = NULL),
     optparse::make_option("--summary_output_path", type = "character", default = NULL),
@@ -394,7 +385,6 @@ if (sys.nframe() == 0L) {
     distance_metric = opt$distance_metric,
     checkpoint_dir = opt$checkpoint_dir,
     checkpoint_batch_size = if (is.null(opt$checkpoint_batch_size)) opt$n_cores else opt$checkpoint_batch_size,
-    update_aggregate = update_aggregate && identical(opt$fit_mode, "pooled_group_v1"), fit_mode = opt$fit_mode,
-    calibration_status = opt$calibration_status
+    update_aggregate = update_aggregate && identical(opt$fit_mode, "pooled_group_v1"), fit_mode = opt$fit_mode
   )
 }

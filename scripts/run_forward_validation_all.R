@@ -29,10 +29,8 @@ run_forward_validation_all_main <- function(grouped_intervals_path = "core_data/
                                             fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
                                             checkpoint_dir = file.path(output_dir, "forward_checkpoints_interval_v1"),
                                             checkpoint_batch_size = n_cores,
-                                            aggregate_output_path = forward_validation_default_paths(fit_mode)$aggregate_output_path,
-                                            calibration_status = c("pending_refit_calibration", "deferred_by_user")) {
+                                            aggregate_output_path = forward_validation_default_paths(fit_mode)$aggregate_output_path) {
   fit_mode <- match.arg(fit_mode)
-  calibration_status <- match.arg(calibration_status)
   distance_metric <- match.arg(distance_metric)
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(summary_output_dir, recursive = TRUE, showWarnings = FALSE)
@@ -70,8 +68,7 @@ run_forward_validation_all_main <- function(grouped_intervals_path = "core_data/
       seed = if (fit_mode == "pooled_group_v1") seed + 1000L * i else seed,
       distance_metric = distance_metric, fit_mode = fit_mode,
       checkpoint_dir = if (fit_mode != "pooled_group_v1") checkpoint_dir else NULL,
-      checkpoint_batch_size = checkpoint_batch_size, update_aggregate = FALSE,
-      calibration_status = calibration_status
+      checkpoint_batch_size = checkpoint_batch_size, update_aggregate = FALSE
     )
     result_paths[i] <- output_path
   }
@@ -90,7 +87,6 @@ if (sys.nframe() == 0L) {
     optparse::make_option("--grouped_intervals_path", type = "character", default = "core_data/grouped_intervals.Rds"),
     optparse::make_option("--group_fit_path", type = "character", default = NULL),
     optparse::make_option("--fit_mode", type = "character", default = "pooled_group_v1"),
-    optparse::make_option("--calibration_status", type = "character", default = "pending_refit_calibration"),
     optparse::make_option("--checkpoint_dir", type = "character", default = NULL),
     optparse::make_option("--checkpoint_batch_size", type = "integer", default = NULL),
     optparse::make_option("--aggregate_output_path", type = "character", default = NULL),
@@ -131,6 +127,6 @@ if (sys.nframe() == 0L) {
     distance_metric = opt$distance_metric, fit_mode = opt$fit_mode,
     checkpoint_dir = if (is.null(opt$checkpoint_dir)) file.path(opt$output_dir, "forward_checkpoints_interval_v1") else opt$checkpoint_dir,
     checkpoint_batch_size = if (is.null(opt$checkpoint_batch_size)) opt$n_cores else opt$checkpoint_batch_size,
-    aggregate_output_path = opt$aggregate_output_path, calibration_status = opt$calibration_status
+    aggregate_output_path = opt$aggregate_output_path
   )
 }

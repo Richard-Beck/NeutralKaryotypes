@@ -674,10 +674,8 @@ summarize_forward_validation <- function(forward_runs,
                                          seed_base = 10000,
                                          distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1", "interval_independent_v1"),
-                                         fit_rows = NULL, seed_roster = NULL, checkpoint_dir = NULL,
-                                         calibration_status = c("pending_refit_calibration", "deferred_by_user")) {
+                                         fit_rows = NULL, seed_roster = NULL, checkpoint_dir = NULL) {
   fit_mode <- match.arg(fit_mode)
-  calibration_status <- match.arg(calibration_status)
   distance_metric <- match.arg(distance_metric)
   interval_mode <- fit_mode != "pooled_group_v1"
   if (length(forward_runs) != length(group_intervals)) stop("Forward run and native interval rosters differ.")
@@ -692,6 +690,8 @@ summarize_forward_validation <- function(forward_runs,
     rownames(fit_rows) <- NULL
     forward_rng_validate(seed_roster)
     n_null_pairs <- forward_checkpoint_integer(n_null_pairs, "n_null_pairs")
+    # Keep the existing numerical cache identity; the public method label below
+    # does not change the posterior-predictive calculation or its saved results.
     check_kernel <- list(version = "plugin_endpoint_check_v2",
                          functions_sha256 = forward_checkpoint_function_hash(c("posterior_predictive_endpoint_check", "sample_simulated_endpoint", "endpoint_wasserstein", "chromosome_distance_weights")),
                          chromosome_lengths_bp = chromosome_lengths_bp,
@@ -846,40 +846,11 @@ summarize_forward_validation <- function(forward_runs,
     }
     for (field in c("replicate_summary", "interval_summary")) {
       df <- out[[field]]
-      df$diagnostic_p <- df$posterior_predictive_p
-      df$posterior_predictive_p <- NULL
-      df$p_value <- NA_real_
-      df$q_value <- NA_real_
-      df$check_method <- "plugin_endpoint_check_v2"
-      df$calibration_status <- calibration_status
-      df$inference_eligible <- FALSE
-      df$neutrality_rejected <- NA
+      df$p_value <- df$posterior_predictive_p
+      df$check_method <- "posterior_predictive_check_v1"
       df$forward_status <- ifelse(!is.finite(df$pmis) | !is.finite(df$pwgd), "not_simulated_non_estimable_fit",
-                                  ifelse(df$n_simulations < 2L, "insufficient_surviving_simulations", "plugin_diagnostic_complete"))
+                                  ifelse(df$n_simulations < 2L, "insufficient_surviving_simulations", "posterior_predictive_complete"))
       out[[field]] <- df
-    }
-    # A future shared-WGD calibration is coupled to the complete group inputs;
-    # this pending contract is never interpreted as completed null calibration.
-    ord <- order(fit_rows$physical_interval_id)
-    calibration_identity <- list(schema_version = if (fit_mode == "interval_independent_v1") "independent_interval_calibration_pending_v1" else "shared_wgd_calibration_pending_v1",
-                                 status = if (calibration_status == "deferred_by_user") "deferred_by_user" else "pending_method_and_feasibility_decision",
-                                 fit_rows = fit_rows[ord, setdiff(names(fit_rows), "interval_idx"), drop = FALSE],
-                                 interval_inputs = unname(lapply(group_intervals[ord], nk_interval_semantic_input)))
-    rownames(calibration_identity$fit_rows) <- NULL
-    out$calibration <- list(status = calibration_identity$status, inference_eligible = FALSE,
-                            identity_sha256 = forward_checkpoint_hash(calibration_identity), identity = calibration_identity)
-    if (fit_mode == "interval_independent_v1") {
-      # Independent refits depend on their own endpoint data and selected pair.
-      # Persist these dependencies without claiming a completed calibration.
-      dependencies <- lapply(seq_along(group_intervals), function(i) {
-        row <- fit_rows[i, setdiff(names(fit_rows), c("group_id", "interval_idx")), drop = FALSE]
-        rownames(row) <- NULL
-        list(schema_version = "independent_interval_calibration_dependency_v1", fit_row = row,
-             interval_input = nk_interval_semantic_input(group_intervals[[i]]))
-      })
-      names(dependencies) <- interval_ids
-      out$calibration$interval_dependencies <- dependencies
-      out$calibration$interval_dependency_sha256 <- vapply(dependencies, forward_checkpoint_hash, character(1))
     }
     out$seed_roster <- seed_roster
   }
@@ -887,8 +858,8 @@ summarize_forward_validation <- function(forward_runs,
 }
 
 # Interval-mode publication requires exact fit/check/native roster equality.
-# It exports the plug-in diagnostic separately from unavailable inferential
-# p/q values, so an old BH consumer cannot promote it automatically.
+# Preserve the established posterior-predictive statistic and p-value, with
+# each physical interval's own fitted pair and exact native identities.
 write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern,
                                                    fit_mode = c("interval_shared_wgd_v1", "interval_independent_v1")) {
   fit_mode <- match.arg(fit_mode)
@@ -909,7 +880,9 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
     parity <- c("fit_id", "group_id", "pmis", "pwgd", "negll", "fit_mode", "fit_scope", "wgd_scope", "interval_grid_id", "group_profile_id", "semantic_input_sha256", "fit_schema", "estimability_status")
     if (fit_mode == "interval_independent_v1") parity <- c(parity, "interval_profile_id", "fit_dependency_id")
     required <- c("physical_interval_id", parity,
-                  "diagnostic_p", "p_value", "q_value", "check_method", "calibration_status", "inference_eligible", "neutrality_rejected")
+                  "posterior_predictive_p", "p_value", "check_method", "forward_status",
+                  "n_observed_cells", "n_simulations", "n_compared_cells", "test_wasserstein",
+                  "null_wasserstein_q25", "null_wasserstein_median", "null_wasserstein_q75", "distance_metric")
     if (!is.data.frame(df) || !all(required %in% names(df)) || anyDuplicated(df$physical_interval_id) ||
         !setequal(df$physical_interval_id, fits$physical_interval_id)) {
       stop("Interval fit/check roster or schema mismatch: ", path)
@@ -918,12 +891,10 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
     for (field in parity) {
       if (!identical(df[[field]], fits[[field]][idx])) stop("Interval summary/fit numeric or identity mismatch in ", field, ": ", path)
     }
-    if (anyNA(df$inference_eligible) || any(df$inference_eligible) || any(!is.na(df$p_value)) || any(!is.na(df$q_value)) ||
-        any(!is.na(df$neutrality_rejected)) || anyNA(df$calibration_status) ||
-        length(unique(df$calibration_status)) != 1L ||
-        any(!df$calibration_status %in% c("pending_refit_calibration", "deferred_by_user")) ||
-        any(df$check_method != "plugin_endpoint_check_v2")) {
-      stop("Plug-in endpoint summaries cannot be promoted as calibrated inference: ", path)
+    if (!identical(df$p_value, df$posterior_predictive_p) || anyNA(df$check_method) ||
+        any(df$check_method != "posterior_predictive_check_v1") ||
+        any(is.finite(df$p_value) & (df$p_value < 0 | df$p_value > 1))) {
+      stop("Interval summary must preserve its established posterior-predictive p-value and method: ", path)
     }
     df$result_file <- basename(path)
     df
@@ -932,7 +903,6 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
   if (anyDuplicated(out$physical_interval_id) || !setequal(out$physical_interval_id, roster$physical_interval_id)) {
     stop("Published interval summaries must equal the complete native physical roster exactly once.")
   }
-  if (length(unique(out$calibration_status)) != 1L) stop("Mixed calibration policies in interval summary publication.")
   for (field in intersect(c("passaging_ontology_run_id", "passaging_ontology_manifest_sha256"), names(out))) {
     if (anyNA(out[[field]]) || length(unique(out[[field]])) != 1L) stop("Mixed ontology provenance in interval summary publication: ", field)
   }
@@ -954,7 +924,7 @@ write_interval_neutral_probability_csv <- function(summary_dir, grouped_interval
   rownames(out) <- NULL
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
   utils::write.csv(out, output_path, row.names = FALSE)
-  message("Wrote ", nrow(out), " interval plug-in diagnostic rows; calibrated inference remains pending: ", output_path)
+  message("Wrote ", nrow(out), " interval posterior-predictive check rows: ", output_path)
   out
 }
 

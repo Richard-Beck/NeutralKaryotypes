@@ -500,8 +500,8 @@ run_checkpointed_forward_runs <- function(group_intervals, fit_row, bottleneck_s
   out
 }
 
-# The current endpoint check is a plug-in diagnostic, not a calibrated test.
-# Cache it separately from raw simulations and the still-pending refit method.
+# Cache the established posterior-predictive endpoint check separately from
+# raw simulations so reporting can resume without rerunning those simulations.
 forward_checkpoint_endpoint_check <- function(identity, checkpoint_dir, compute) {
   key <- forward_checkpoint_hash(identity)
   path <- file.path(checkpoint_dir, "endpoint_checks", paste0(key, ".Rds"))
