@@ -259,6 +259,7 @@ summarize_zero_copy_states <- function(simulation_intervals) {
 # Inputs: `group_fit_df` produced by `estimate_group_pmis_grid()`.
 # Output: data.frame with one best row per group.
 select_best_group_fits <- function(group_fit_df) {
+  assert_legacy_pooled_fits(group_fit_df)
   best <- do.call(rbind, lapply(split(group_fit_df, group_fit_df$group_id), function(df) {
     df[which.min(df$negll), c("group_id", "pmis", "pwgd", "negll", "n_members")]
   }))
@@ -270,6 +271,7 @@ select_best_group_fits <- function(group_fit_df) {
 # Inputs: `group_fit_df` produced by `estimate_group_pmis_grid()`.
 # Output: data.frame with one best row per `(group_id, pwgd)` combination.
 select_best_group_fits_by_pwgd <- function(group_fit_df) {
+  assert_legacy_pooled_fits(group_fit_df)
   best <- do.call(rbind, lapply(
     split(group_fit_df, list(group_fit_df$group_id, group_fit_df$pwgd), drop = TRUE),
     function(df) df[which.min(df$negll), c("group_id", "pmis", "pwgd", "negll", "n_members")]
@@ -278,10 +280,72 @@ select_best_group_fits_by_pwgd <- function(group_fit_df) {
   best
 }
 
+# The named legacy readers stay available to frozen clients, but never reduce
+# interval rows into a pooled optimum or silently accept a mixed generation.
+assert_legacy_pooled_fits <- function(fits) {
+  if (!is.data.frame(fits) || "physical_interval_id" %in% names(fits) ||
+      ("fit_mode" %in% names(fits) && anyNA(fits$fit_mode)) ||
+      ("fit_mode" %in% names(fits) && any(fits$fit_mode != "pooled_group_v1"))) {
+    stop("Legacy pooled fit readers cannot consume interval or mixed fit rows.")
+  }
+  invisible(fits)
+}
+
+select_forward_fits <- function(fit_table, grouped_intervals,
+                                fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "pooled_group_v1") return(select_best_group_fits(fit_table))
+  if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
+  selected <- nk_select_interval_fits(fit_table)
+  nk_validate_interval_fits(selected, grouped_intervals)
+}
+
+# Keep opt-in interval outputs separate from frozen pooled artifacts. Explicit
+# caller paths are still authoritative; these values apply only when omitted.
+forward_validation_default_paths <- function(fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  interval_mode <- fit_mode == "interval_shared_wgd_v1"
+  output_dir <- if (interval_mode) "results/interval_forward_validation" else "results"
+  list(
+    group_fit_path = if (interval_mode) "results/interval_fit_grid.Rds" else "results/group_fit_df.Rds",
+    output_dir = output_dir,
+    output_path = file.path(output_dir, "forward_validation.Rds"),
+    summary_output_dir = if (interval_mode) "result_summaries/interval_forward_validation" else "result_summaries",
+    aggregate_output_path = if (interval_mode) "data/neutral_interval_diagnostics.csv" else "data/neutral_probability.csv"
+  )
+}
+
 # Build ploidy diagnostics comparing observed endpoints to Markov predictions.
 # Inputs: grouped intervals and the best-per-`p_wgd` fit table.
 # Output: list with `predicted` and `observed` data.frames ready for plotting.
-build_ploidy_diagnostics <- function(grouped_intervals, best_by_pwgd) {
+build_ploidy_diagnostics <- function(grouped_intervals, best_by_pwgd,
+                                    fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "interval_shared_wgd_v1") {
+    if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
+    fits <- nk_validate_interval_fits(best_by_pwgd, grouped_intervals)
+    if (any(!is.finite(fits$pmis) | !is.finite(fits$pwgd))) stop("Prediction diagnostics require estimable interval fits.")
+    rows <- lapply(seq_len(nrow(fits)), function(i) {
+      fit <- fits[i, , drop = FALSE]
+      interval <- grouped_intervals[[fit$group_id]][[fit$interval_idx]]
+      # Reuse the existing prediction kernel with this interval's already
+      # selected pair; no nuisance refitting or regrouping is performed here.
+      predicted <- predict_group_ploidy_distribution(list(interval), fit$pmis, fit$pwgd)
+      observed <- stats::aggregate(list(value = rep(1, nrow(interval$end_karyotype))),
+                                   list(ploidy = rowMeans(round(interval$end_karyotype))), sum)
+      observed$value <- observed$value / sum(observed$value)
+      predicted <- data.frame(ploidy = predicted$ploidy, value = predicted$prob)
+      bind <- function(df, type) {
+        df$type <- type
+        for (field in c("physical_interval_id", "group_id", "interval_idx", "fit_id", "pmis", "pwgd")) df[[field]] <- fit[[field]]
+        df
+      }
+      list(predicted = bind(predicted, "predicted"), observed = bind(observed, "observed"))
+    })
+    return(list(predicted = do.call(rbind, lapply(rows, `[[`, "predicted")),
+                observed = do.call(rbind, lapply(rows, `[[`, "observed"))))
+  }
+  assert_legacy_pooled_fits(best_by_pwgd)
   ploidy_pred_diag <- do.call(rbind, lapply(seq_len(nrow(best_by_pwgd)), function(i) {
     group_id <- best_by_pwgd$group_id[i]
     pred_df <- predict_group_ploidy_distribution(
@@ -326,7 +390,14 @@ build_ploidy_diagnostics <- function(grouped_intervals, best_by_pwgd) {
 build_marginal_cn_diagnostics <- function(grouped_intervals,
                                           best_by_pwgd,
                                           chr_idx = 1:2,
-                                          states = 0:8) {
+                                          states = 0:8,
+                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "interval_shared_wgd_v1") {
+    if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
+    best_by_pwgd <- nk_validate_interval_fits(best_by_pwgd, grouped_intervals)
+    if (any(!is.finite(best_by_pwgd$pmis) | !is.finite(best_by_pwgd$pwgd))) stop("Prediction diagnostics require estimable interval fits.")
+  } else assert_legacy_pooled_fits(best_by_pwgd)
   chr_idx <- as.integer(chr_idx)
   chr_labels <- paste0("chr", chr_idx)
 
@@ -334,7 +405,8 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
     group_id <- best_by_pwgd$group_id[i]
     group_intervals <- grouped_intervals[[group_id]]
 
-    do.call(rbind, lapply(seq_along(group_intervals), function(interval_id) {
+    indices <- if (fit_mode == "interval_shared_wgd_v1") best_by_pwgd$interval_idx[i] else seq_along(group_intervals)
+    do.call(rbind, lapply(indices, function(interval_id) {
       interval <- group_intervals[[interval_id]]
       P_pred <- predict_marginal_cn_probs(
         K0 = interval$start_karyotype,
@@ -345,7 +417,7 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
       )
 
       do.call(rbind, lapply(chr_idx, function(chr) {
-        data.frame(
+        row <- data.frame(
           group_id = group_id,
           interval_id = interval_id,
           pwgd = best_by_pwgd$pwgd[i],
@@ -355,6 +427,12 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
           type = "predicted",
           stringsAsFactors = FALSE
         )
+        if (fit_mode == "interval_shared_wgd_v1") {
+          row$physical_interval_id <- best_by_pwgd$physical_interval_id[i]
+          row$fit_id <- best_by_pwgd$fit_id[i]
+          row$pmis <- best_by_pwgd$pmis[i]
+        }
+        row
       }))
     }))
   }))
@@ -369,7 +447,7 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
       do.call(rbind, lapply(chr_idx, function(chr) {
         counts <- table(factor(KT[, chr], levels = states))
         probs <- as.numeric(counts) / sum(counts)
-        data.frame(
+        row <- data.frame(
           group_id = group_id,
           interval_id = interval_id,
           chromosome = paste0("chr", chr),
@@ -378,6 +456,8 @@ build_marginal_cn_diagnostics <- function(grouped_intervals,
           type = "observed",
           stringsAsFactors = FALSE
         )
+        if (fit_mode == "interval_shared_wgd_v1") row$physical_interval_id <- nk_physical_interval_id(interval)
+        row
       }))
     }))
   }))
@@ -493,14 +573,22 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
                                                 simulated_matrices,
                                                 n_pairs = 100,
                                                 seed = 1,
-                                                distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+                                                distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
+                                                subsample_seeds = NULL, null_pair_seed = NULL) {
   distance_metric <- match.arg(distance_metric)
   observed_matrix <- round(as.matrix(observed_matrix))
-  simulated_matrices <- Filter(function(M) nrow(as.matrix(M)) > 0, simulated_matrices)
+  nonempty <- vapply(simulated_matrices, function(M) nrow(as.matrix(M)) > 0L, logical(1))
+  if (!is.null(subsample_seeds)) {
+    if (length(subsample_seeds) != length(simulated_matrices) || anyNA(subsample_seeds) || is.null(null_pair_seed)) {
+      stop("Stable endpoint-check seeds must account for every simulation replicate and null-pair selection.")
+    }
+    subsample_seeds <- subsample_seeds[nonempty]
+  }
+  simulated_matrices <- simulated_matrices[nonempty]
   n_observed <- nrow(observed_matrix)
 
   if (!n_observed || length(simulated_matrices) < 2L) {
-    return(list(
+    out <- list(
       observed_distances = numeric(),
       null_distances = numeric(),
       summary = list(
@@ -515,14 +603,16 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
         distance_metric = distance_metric
       ),
       ploidy = numeric()
-    ))
+    )
+    if (!is.null(subsample_seeds)) out$simulation_rep_indices <- which(nonempty)
+    return(out)
   }
 
   sampled_sims <- lapply(seq_along(simulated_matrices), function(i) {
     sample_simulated_endpoint(
       simulated_matrix = simulated_matrices[[i]],
       target_n = n_observed,
-      seed = seed + i
+      seed = if (is.null(subsample_seeds)) seed + i else subsample_seeds[i]
     )
   })
 
@@ -533,7 +623,7 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
 
   pair_idx <- utils::combn(seq_along(sampled_sims), 2L)
   if (ncol(pair_idx) > n_pairs) {
-    set.seed(seed + 10000L)
+    set.seed(if (is.null(null_pair_seed)) seed + 10000L else null_pair_seed)
     pair_idx <- pair_idx[, sample(seq_len(ncol(pair_idx)), size = n_pairs, replace = FALSE), drop = FALSE]
   }
   null_distances <- vapply(seq_len(ncol(pair_idx)), function(k) {
@@ -544,7 +634,7 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
     )
   }, numeric(1))
 
-  list(
+  out <- list(
     observed_distances = observed_distances,
     null_distances = null_distances,
     summary = list(
@@ -560,6 +650,8 @@ posterior_predictive_endpoint_check <- function(observed_matrix,
     ),
     sampled_sims = sampled_sims
   )
+  if (!is.null(subsample_seeds)) out$simulation_rep_indices <- which(nonempty)
+  out
 }
 
 # Summarize forward simulations against observed endpoints for one fitted group.
@@ -570,17 +662,59 @@ summarize_forward_validation <- function(forward_runs,
                                          group_id,
                                          n_null_pairs = 100,
                                          seed_base = 10000,
-                                         distance_metric = c("chrom_weighted_wasserstein", "wasserstein")) {
+                                         distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
+                                         fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1"),
+                                         fit_rows = NULL, seed_roster = NULL, checkpoint_dir = NULL) {
+  fit_mode <- match.arg(fit_mode)
   distance_metric <- match.arg(distance_metric)
+  interval_mode <- fit_mode == "interval_shared_wgd_v1"
+  if (length(forward_runs) != length(group_intervals)) stop("Forward run and native interval rosters differ.")
+  if (interval_mode) {
+    if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
+    if (!exists("forward_rng_validate", mode = "function")) source("R/forward_checkpoint_utils.R")
+    fit_rows <- nk_validate_interval_fits(fit_rows, stats::setNames(list(group_intervals), group_id))
+    interval_ids <- unname(vapply(group_intervals, nk_physical_interval_id, character(1)))
+    fit_rows <- fit_rows[match(interval_ids, fit_rows$physical_interval_id), , drop = FALSE]
+    fit_rows <- data.frame(fit_rows, check.names = FALSE, stringsAsFactors = FALSE)
+    rownames(fit_rows) <- NULL
+    forward_rng_validate(seed_roster)
+    n_null_pairs <- forward_checkpoint_integer(n_null_pairs, "n_null_pairs")
+    check_kernel <- list(version = "plugin_endpoint_check_v2",
+                         functions_sha256 = forward_checkpoint_function_hash(c("posterior_predictive_endpoint_check", "sample_simulated_endpoint", "endpoint_wasserstein", "chromosome_distance_weights")),
+                         chromosome_lengths_bp = chromosome_lengths_bp,
+                         R_version = R.version.string, rng_kind = RNGkind(),
+                         transport_version = as.character(utils::packageVersion("transport")))
+  }
   interval_checks <- lapply(seq_along(forward_runs), function(interval_idx) {
     sim_matrices <- lapply(forward_runs[[interval_idx]], `[[`, "final_matrix")
-    posterior_predictive_endpoint_check(
+    if (!interval_mode) {
+      return(posterior_predictive_endpoint_check(
+        observed_matrix = group_intervals[[interval_idx]]$end_karyotype,
+        simulated_matrices = sim_matrices, n_pairs = n_null_pairs,
+        seed = seed_base + interval_idx * 100, distance_metric = distance_metric))
+    }
+    id <- interval_ids[interval_idx]
+    fit <- fit_rows[interval_idx, , drop = FALSE]
+    for (sim in forward_runs[[interval_idx]]) {
+      if (!identical(sim$p_mis, fit$pmis) || !identical(sim$p_wgd, fit$pwgd) ||
+          !identical(nk_physical_interval_id(sim$interval), id) ||
+          !identical(nk_interval_semantic_input(sim$interval), nk_interval_semantic_input(group_intervals[[interval_idx]]))) {
+        stop("Forward simulations do not match the exact interval fit and inputs.")
+      }
+    }
+    subsample_seeds <- forward_rng_lookup(seed_roster, id, "endpoint_subsample", seq_along(sim_matrices))
+    pair_seed <- forward_rng_lookup(seed_roster, id, "endpoint_null_pairs", 0L)
+    identity <- list(schema_version = "neutral_plugin_endpoint_checkpoint_v1", physical_interval_id = id,
+                     fit_id = fit$fit_id, pmis = fit$pmis, pwgd = fit$pwgd,
+                     observed_matrix = group_intervals[[interval_idx]]$end_karyotype,
+                     simulation_sha256 = vapply(sim_matrices, forward_checkpoint_hash, character(1)),
+                     n_null_pairs = n_null_pairs, distance_metric = distance_metric,
+                     subsample_seeds = subsample_seeds, null_pair_seed = pair_seed, kernel = check_kernel)
+    compute <- function() posterior_predictive_endpoint_check(
       observed_matrix = group_intervals[[interval_idx]]$end_karyotype,
-      simulated_matrices = sim_matrices,
-      n_pairs = n_null_pairs,
-      seed = seed_base + interval_idx * 100,
-      distance_metric = distance_metric
-    )
+      simulated_matrices = sim_matrices, n_pairs = n_null_pairs, distance_metric = distance_metric,
+      subsample_seeds = subsample_seeds, null_pair_seed = pair_seed)
+    if (is.null(checkpoint_dir)) compute() else forward_checkpoint_endpoint_check(identity, checkpoint_dir, compute)
   })
 
   forward_summary <- do.call(rbind, lapply(seq_along(interval_checks), function(interval_idx) {
@@ -627,7 +761,7 @@ summarize_forward_validation <- function(forward_runs,
       sampled_sim <- check$sampled_sims[[rep_idx]]
       data.frame(
         interval_idx = interval_idx,
-        rep_idx = rep_idx,
+        rep_idx = if (is.null(check$simulation_rep_indices)) rep_idx else check$simulation_rep_indices[rep_idx],
         ploidy = rowMeans(sampled_sim),
         type = "simulated_matched",
         stringsAsFactors = FALSE
@@ -649,38 +783,161 @@ summarize_forward_validation <- function(forward_runs,
     check <- interval_checks[[interval_idx]]
     rbind(
       data.frame(
-        interval_idx = interval_idx,
+        interval_idx = rep(interval_idx, length(check$observed_distances)),
         distance = check$observed_distances,
-        comparison = "observed_vs_simulated",
-        distance_metric = check$summary$distance_metric,
+        comparison = rep("observed_vs_simulated", length(check$observed_distances)),
+        distance_metric = rep(check$summary$distance_metric, length(check$observed_distances)),
         stringsAsFactors = FALSE
       ),
       data.frame(
-        interval_idx = interval_idx,
+        interval_idx = rep(interval_idx, length(check$null_distances)),
         distance = check$null_distances,
-        comparison = "simulated_vs_simulated",
-        distance_metric = check$summary$distance_metric,
+        comparison = rep("simulated_vs_simulated", length(check$null_distances)),
+        distance_metric = rep(check$summary$distance_metric, length(check$null_distances)),
         stringsAsFactors = FALSE
       )
     )
   }))
 
-  list(
+  out <- list(
     replicate_summary = forward_summary,
     interval_summary = interval_summary,
     ploidy = rbind(simulated_ploidy, observed_ploidy),
     distance_plot = distance_plot_df,
     interval_checks = interval_checks
   )
+  if (interval_mode) {
+    identity_columns <- c("physical_interval_id", "fit_id", "fit_mode", "fit_scope", "wgd_scope", "pmis", "pwgd", "negll", "interval_grid_id", "group_profile_id", "semantic_input_sha256", "fit_schema", "estimability_status")
+    identity_columns <- intersect(identity_columns, names(fit_rows))
+    ontology_fields <- c("passaging_ontology_run_id", "passaging_ontology_manifest_sha256")
+    ontology_values <- lapply(ontology_fields, function(field) {
+      present <- vapply(group_intervals, function(interval) !is.null(interval[[field]]), logical(1))
+      if (!any(present)) return(NULL)
+      if (!all(present)) stop("Mixed missing ontology provenance in the interval forward roster: ", field)
+      values <- vapply(group_intervals, function(interval) {
+        value <- interval[[field]]
+        if (!is.character(value) || length(value) != 1L || is.na(value) || !nzchar(value)) stop("Invalid ontology provenance: ", field)
+        value
+      }, character(1))
+      if (length(unique(values)) != 1L) stop("Mixed ontology generations in the interval forward roster: ", field)
+      values
+    })
+    names(ontology_values) <- ontology_fields
+    attach_fit <- function(df) {
+      for (field in identity_columns) df[[field]] <- fit_rows[[field]][df$interval_idx]
+      for (field in ontology_fields) if (!is.null(ontology_values[[field]])) df[[field]] <- ontology_values[[field]][df$interval_idx]
+      df
+    }
+    for (field in c("replicate_summary", "interval_summary", "ploidy", "distance_plot")) {
+      out[[field]] <- attach_fit(out[[field]])
+    }
+    for (field in c("replicate_summary", "interval_summary")) {
+      df <- out[[field]]
+      df$diagnostic_p <- df$posterior_predictive_p
+      df$posterior_predictive_p <- NULL
+      df$p_value <- NA_real_
+      df$q_value <- NA_real_
+      df$check_method <- "plugin_endpoint_check_v2"
+      df$calibration_status <- "pending_refit_calibration"
+      df$inference_eligible <- FALSE
+      df$neutrality_rejected <- NA
+      df$forward_status <- ifelse(!is.finite(df$pmis) | !is.finite(df$pwgd), "not_simulated_non_estimable_fit",
+                                  ifelse(df$n_simulations < 2L, "insufficient_surviving_simulations", "plugin_diagnostic_complete"))
+      out[[field]] <- df
+    }
+    # A future shared-WGD calibration is coupled to the complete group inputs;
+    # this pending contract is never interpreted as completed null calibration.
+    ord <- order(fit_rows$physical_interval_id)
+    calibration_identity <- list(schema_version = "shared_wgd_calibration_pending_v1",
+                                 status = "pending_method_and_feasibility_decision",
+                                 fit_rows = fit_rows[ord, setdiff(names(fit_rows), "interval_idx"), drop = FALSE],
+                                 interval_inputs = unname(lapply(group_intervals[ord], nk_interval_semantic_input)))
+    rownames(calibration_identity$fit_rows) <- NULL
+    out$calibration <- list(status = calibration_identity$status, inference_eligible = FALSE,
+                            identity_sha256 = forward_checkpoint_hash(calibration_identity), identity = calibration_identity)
+    out$seed_roster <- seed_roster
+  }
+  out
+}
+
+# Interval-mode publication requires exact fit/check/native roster equality.
+# It exports the plug-in diagnostic separately from unavailable inferential
+# p/q values, so an old BH consumer cannot promote it automatically.
+write_interval_neutral_probability_csv <- function(summary_dir, grouped_intervals_path, output_path, summary_pattern) {
+  if (!exists("nk_validate_interval_fits", mode = "function")) source("R/interval_fit_utils.R")
+  if (!file.exists(grouped_intervals_path)) stop("Interval summary publication requires the native grouped intervals.")
+  grouped <- readRDS(grouped_intervals_path)
+  roster <- nk_interval_roster(grouped)
+  paths <- list.files(summary_dir, pattern = summary_pattern, full.names = TRUE)
+  if (!length(paths)) stop("No interval summaries found for the required native roster.")
+  tables <- lapply(paths, function(path) {
+    res <- readRDS(path)
+    if (!identical(res$settings$fit_mode, "interval_shared_wgd_v1") ||
+        !res$forward_group_id %in% names(grouped)) {
+      stop("Interval summary writer rejects legacy, mixed or unknown-group summaries: ", path)
+    }
+    fits <- nk_validate_interval_fits(res$fit_row, grouped[res$forward_group_id])
+    df <- res$interval_summary
+    parity <- c("fit_id", "group_id", "pmis", "pwgd", "negll", "fit_mode", "fit_scope", "wgd_scope", "interval_grid_id", "group_profile_id", "semantic_input_sha256", "fit_schema", "estimability_status")
+    required <- c("physical_interval_id", parity,
+                  "diagnostic_p", "p_value", "q_value", "check_method", "calibration_status", "inference_eligible", "neutrality_rejected")
+    if (!is.data.frame(df) || !all(required %in% names(df)) || anyDuplicated(df$physical_interval_id) ||
+        !setequal(df$physical_interval_id, fits$physical_interval_id)) {
+      stop("Interval fit/check roster or schema mismatch: ", path)
+    }
+    idx <- match(df$physical_interval_id, fits$physical_interval_id)
+    for (field in parity) {
+      if (!identical(df[[field]], fits[[field]][idx])) stop("Interval summary/fit numeric or identity mismatch in ", field, ": ", path)
+    }
+    if (anyNA(df$inference_eligible) || any(df$inference_eligible) || any(!is.na(df$p_value)) || any(!is.na(df$q_value)) ||
+        any(!is.na(df$neutrality_rejected)) || any(df$calibration_status != "pending_refit_calibration") ||
+        any(df$check_method != "plugin_endpoint_check_v2")) {
+      stop("Plug-in endpoint summaries cannot be promoted as calibrated inference: ", path)
+    }
+    df$result_file <- basename(path)
+    df
+  })
+  out <- do.call(rbind, tables)
+  if (anyDuplicated(out$physical_interval_id) || !setequal(out$physical_interval_id, roster$physical_interval_id)) {
+    stop("Published interval summaries must equal the complete native physical roster exactly once.")
+  }
+  for (field in intersect(c("passaging_ontology_run_id", "passaging_ontology_manifest_sha256"), names(out))) {
+    if (anyNA(out[[field]]) || length(unique(out[[field]])) != 1L) stop("Mixed ontology provenance in interval summary publication: ", field)
+  }
+  out <- out[order(out$physical_interval_id), , drop = FALSE]
+  idx <- match(out$physical_interval_id, roster$physical_interval_id)
+  if (any(out$group_id != roster$group_id[idx])) stop("Summary group identities disagree with native physical intervals.")
+  out$interval_idx <- roster$interval_idx[idx]
+  intervals <- lapply(seq_len(nrow(out)), function(i) grouped[[out$group_id[i]]][[out$interval_idx[i]]])
+  out$condition <- out$group_id
+  out$replicate_id <- vapply(intervals, `[[`, character(1), "end")
+  out$ancestor <- vapply(intervals, `[[`, character(1), "start")
+  out$delta_pass <- vapply(intervals, function(interval) {
+    if (is.null(interval$elapsed_passages)) NA_real_ else as.numeric(interval$elapsed_passages)
+  }, numeric(1))
+  out$cin_rate <- out$pmis
+  out$p_wgd <- out$pwgd
+  out$fit_negll <- out$negll
+  out$summary_schema <- "neutral_interval_forward_summary_v1"
+  rownames(out) <- NULL
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(out, output_path, row.names = FALSE)
+  message("Wrote ", nrow(out), " interval plug-in diagnostic rows; calibrated inference remains pending: ", output_path)
+  out
 }
 
 # Aggregate cached forward-validation summaries into a flat neutrality results table.
 # Inputs: summary directory/path pattern, grouped intervals, and output CSV path.
 # Output: data.frame written to `output_path`, compatible with the old neutral_probability.csv columns.
-write_neutral_probability_csv <- function(summary_dir = "result_summaries",
+write_neutral_probability_csv <- function(summary_dir = forward_validation_default_paths(fit_mode)$summary_output_dir,
                                           grouped_intervals_path = "core_data/grouped_intervals.Rds",
-                                          output_path = "data/neutral_probability.csv",
-                                          summary_pattern = "^forward_validation_.*_summary[.]Rds$") {
+                                          output_path = forward_validation_default_paths(fit_mode)$aggregate_output_path,
+                                          summary_pattern = "^forward_validation_.*_summary[.]Rds$",
+                                          fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "interval_shared_wgd_v1") {
+    return(write_interval_neutral_probability_csv(summary_dir, grouped_intervals_path, output_path, summary_pattern))
+  }
   out_cols <- c(
     "condition", "replicate_id", "ancestor", "p_value", "cin_rate", "delta_pass",
     "p_wgd", "fit_negll", "interval_idx", "test_wasserstein",
@@ -705,6 +962,10 @@ write_neutral_probability_csv <- function(summary_dir = "result_summaries",
 
   forward_validation_summary <- do.call(rbind, lapply(forward_result_files, function(path) {
     res <- readRDS(path)
+    if ((!is.null(res$settings$fit_mode) && !identical(res$settings$fit_mode, "pooled_group_v1")) ||
+        "physical_interval_id" %in% names(res$interval_summary)) {
+      stop("Legacy pooled summary writer cannot consume interval or mixed summaries: ", path)
+    }
     df <- res$interval_summary
     if (is.null(df) || !nrow(df)) {
       return(NULL)

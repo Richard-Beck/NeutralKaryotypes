@@ -214,7 +214,15 @@ estimate_group_pmis_grid <- function(grouped_intervals,
                                      pmis_grid = 10^(seq(-8, -1, length.out = 19)),
                                      pwgd_grid = 0,
                                      states = 0:8,
-                                     eps = 1e-9) {
+                                     eps = 1e-9,
+                                     fit_mode = "pooled_group_v1",
+                                     checkpoint_dir = NULL) {
+  if (identical(fit_mode, "interval_shared_wgd_v1")) {
+    if (!exists("nk_interval_fit_grid", mode = "function")) source("R/interval_fit_utils.R")
+    return(nk_interval_fit_grid(grouped_intervals, pmis_grid = pmis_grid,
+      pwgd_grid = pwgd_grid, checkpoint_dir = checkpoint_dir, states = states, eps = eps))
+  }
+  if (!identical(fit_mode, "pooled_group_v1")) stop("Unknown Markov fit_mode: ", fit_mode)
   if (is.null(names(grouped_intervals))) {
     names(grouped_intervals) <- as.character(seq_along(grouped_intervals))
   }

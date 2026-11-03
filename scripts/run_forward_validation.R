@@ -3,26 +3,33 @@
 if (!requireNamespace("optparse", quietly = TRUE)) {
   stop("scripts/run_forward_validation.R requires the 'optparse' package.")
 }
+source("R/workflow_utils.R")
 
 # Build a lightweight summary object from one forward-validation result.
 # Input: full result list returned by `run_forward_validation_main()`.
 # Output: compact list containing settings, fit row, and interval summaries only.
 forward_validation_summary_object <- function(forward_result) {
-  list(
+  out <- list(
     forward_group_id = forward_result$forward_group_id,
     fit_row = forward_result$fit_row,
     settings = forward_result$settings,
     interval_summary = forward_result$forward_validation$interval_summary,
     replicate_summary = forward_result$forward_validation$replicate_summary
   )
+  if (identical(forward_result$settings$fit_mode, "interval_shared_wgd_v1")) {
+    out$calibration <- forward_result$forward_validation$calibration
+    out$seed_roster <- forward_result$seed_roster
+  }
+  out
 }
 
 # Derive a sidecar summary path from a full forward-validation output path.
 # Input: `output_path` for the full forward-validation RDS.
 # Output: character path for the summary RDS.
-forward_validation_summary_path <- function(output_path) {
+forward_validation_summary_path <- function(output_path,
+                                            fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
   file.path(
-    "result_summaries",
+    forward_validation_default_paths(fit_mode)$summary_output_dir,
     basename(sub("[.]Rds$", "_summary.Rds", output_path))
   )
 }
@@ -46,7 +53,13 @@ run_parallel_forward_runs <- function(group_intervals,
                                       seed,
                                       n_cores = 1L,
                                       checkpoint_dir = NULL,
-                                      checkpoint_batch_size = n_cores) {
+                                      checkpoint_batch_size = n_cores,
+                                      fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1"),
+                                      seed_roster = NULL) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "interval_shared_wgd_v1" && is.null(checkpoint_dir)) {
+    stop("Interval forward runs require a checkpoint directory for stable task and seed provenance.")
+  }
   if (!is.null(checkpoint_dir)) {
     source("R/forward_checkpoint_utils.R")
     return(run_checkpointed_forward_runs(
@@ -54,7 +67,7 @@ run_parallel_forward_runs <- function(group_intervals,
       bottleneck_size = bottleneck_size, expansion_factor = expansion_factor,
       n_reps = n_reps, record_every = record_every, seed = seed,
       checkpoint_dir = checkpoint_dir, n_cores = n_cores,
-      batch_size = checkpoint_batch_size
+      batch_size = checkpoint_batch_size, fit_mode = fit_mode, seed_roster = seed_roster
     ))
   }
   n_cores <- max(1L, as.integer(n_cores))
@@ -114,10 +127,10 @@ run_parallel_forward_runs <- function(group_intervals,
 # Inputs: grouped intervals path, group-fit path, forward group id, output path, and simulation settings.
 # Output: list containing the chosen fit row, forward runs, and forward validation; also written to `output_path`.
 run_forward_validation_main <- function(grouped_intervals_path = "core_data/grouped_intervals.Rds",
-                                        group_fit_path = "results/group_fit_df.Rds",
+                                        group_fit_path = forward_validation_default_paths(fit_mode)$group_fit_path,
                                         forward_group_id,
-                                        output_path = "results/forward_validation.Rds",
-                                        summary_output_path = forward_validation_summary_path(output_path),
+                                        output_path = forward_validation_default_paths(fit_mode)$output_path,
+                                        summary_output_path = forward_validation_summary_path(output_path, fit_mode),
                                         bottleneck_size = 1000L,
                                         expansion_factor = 32L,
                                         n_reps = 30L,
@@ -128,7 +141,9 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
                                         distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
                                         checkpoint_dir = NULL,
                                         checkpoint_batch_size = n_cores,
-                                        update_aggregate = missing(summary_output_path)) {
+                                        update_aggregate = missing(summary_output_path),
+                                        fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("run_forward_validation_main() requires a non-empty `forward_group_id`.")
   }
@@ -142,14 +157,31 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
 
   grouped_intervals <- readRDS(grouped_intervals_path)
   group_fit_df <- readRDS(group_fit_path)
-  best_group_pmis <- select_best_group_fits(group_fit_df)
+  if (!forward_group_id %in% names(grouped_intervals)) stop("Unknown native interval group: ", forward_group_id)
+  best_group_pmis <- if (fit_mode == "pooled_group_v1") select_best_group_fits(group_fit_df) else {
+    select_forward_fits(group_fit_df, grouped_intervals, fit_mode)
+  }
   fit_row <- best_group_pmis[best_group_pmis$group_id == forward_group_id, , drop = FALSE]
   if (!nrow(fit_row)) {
     stop("Could not find forward_group_id in best group fits: ", forward_group_id)
   }
-  fit_row <- fit_row[1, , drop = FALSE]
+  seed_roster <- NULL
+  if (fit_mode == "pooled_group_v1") {
+    fit_row <- fit_row[1, , drop = FALSE]
+  } else {
+    source("R/forward_checkpoint_utils.R")
+    seed_roster <- forward_rng_roster(nk_interval_roster(grouped_intervals)$physical_interval_id, n_reps, seed)
+    if (is.null(checkpoint_dir)) checkpoint_dir <- paste0(output_path, ".checkpoints")
+    # A single-group run cannot implicitly publish a complete global roster.
+    if (missing(update_aggregate)) update_aggregate <- FALSE
+  }
 
-  forward_runs <- run_parallel_forward_runs(
+  non_estimable <- fit_mode == "interval_shared_wgd_v1" &&
+    all(fit_row$estimability_status == "no_finite_shared_wgd_profile")
+  forward_runs <- if (non_estimable) {
+    message("No finite shared-WGD profile; preserving every interval as explicitly not simulated: ", forward_group_id)
+    lapply(grouped_intervals[[forward_group_id]], function(interval) list())
+  } else run_parallel_forward_runs(
     grouped_intervals[[forward_group_id]],
     fit_row = fit_row,
     bottleneck_size = as.integer(bottleneck_size),
@@ -159,21 +191,24 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     seed = as.integer(seed),
     n_cores = as.integer(n_cores),
     checkpoint_dir = checkpoint_dir,
-    checkpoint_batch_size = checkpoint_batch_size
+    checkpoint_batch_size = checkpoint_batch_size,
+    fit_mode = fit_mode, seed_roster = seed_roster
   )
 
   checkpoint_receipts <- attr(forward_runs, "checkpoint_receipts")
   attr(forward_runs, "checkpoint_receipts") <- NULL
+  attr(forward_runs, "seed_roster") <- NULL
 
   forward_validation <- summarize_forward_validation(
     forward_runs = forward_runs,
     group_intervals = grouped_intervals[[forward_group_id]],
     group_id = forward_group_id,
     n_null_pairs = as.integer(n_null_pairs),
-    seed_base = as.integer(seed) * 10000L,
-    distance_metric = distance_metric
+    seed_base = if (fit_mode == "pooled_group_v1") as.integer(seed) * 10000L else as.integer(seed),
+    distance_metric = distance_metric,
+    fit_mode = fit_mode, fit_rows = fit_row, seed_roster = seed_roster,
+    checkpoint_dir = if (fit_mode == "interval_shared_wgd_v1") checkpoint_dir else NULL
   )
-
   out <- list(
     forward_group_id = forward_group_id,
     fit_row = fit_row,
@@ -190,23 +225,37 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
     forward_runs = forward_runs,
     forward_validation = forward_validation
   )
+  if (fit_mode == "interval_shared_wgd_v1") {
+    out$settings$fit_mode <- fit_mode
+    out$settings$summary_schema <- "neutral_interval_forward_summary_v1"
+    out$settings$check_method <- "plugin_endpoint_check_v2"
+    out$settings$calibration_status <- "pending_refit_calibration"
+    out$settings$inference_eligible <- FALSE
+    out$seed_roster <- seed_roster
+  }
   if (!is.null(checkpoint_receipts)) out$checkpoint_receipts <- checkpoint_receipts
 
-  saveRDS(out, output_path)
-  saveRDS(forward_validation_summary_object(out), summary_output_path)
+  if (fit_mode == "interval_shared_wgd_v1") {
+    forward_checkpoint_atomic_save(out, output_path, overwrite = TRUE)
+    forward_checkpoint_atomic_save(forward_validation_summary_object(out), summary_output_path, overwrite = TRUE)
+  } else {
+    saveRDS(out, output_path)
+    saveRDS(forward_validation_summary_object(out), summary_output_path)
+  }
   message("Saved forward validation to ", output_path)
   message("Saved forward validation summary to ", summary_output_path)
   if (isTRUE(update_aggregate) && identical(
     normalizePath(dirname(summary_output_path), mustWork = FALSE),
-    normalizePath("result_summaries", mustWork = FALSE)
+    normalizePath(forward_validation_default_paths(fit_mode)$summary_output_dir, mustWork = FALSE)
   )) {
     write_neutral_probability_csv(
       summary_dir = dirname(summary_output_path),
       grouped_intervals_path = grouped_intervals_path,
-      output_path = "data/neutral_probability.csv"
+      output_path = forward_validation_default_paths(fit_mode)$aggregate_output_path, fit_mode = fit_mode
     )
   } else {
-    message("Skipped aggregate neutral_probability.csv update for explicitly routed or non-default summary output: ", summary_output_path)
+    message("Skipped aggregate ", basename(forward_validation_default_paths(fit_mode)$aggregate_output_path),
+            " update for explicitly routed or non-default summary output: ", summary_output_path)
   }
   out
 }
@@ -216,9 +265,9 @@ run_forward_validation_main <- function(grouped_intervals_path = "core_data/grou
 # Output: cached forward-validation result list.
 load_forward_validation_result <- function(forward_group_id,
                                            grouped_intervals_path = "core_data/grouped_intervals.Rds",
-                                           group_fit_path = "results/group_fit_df.Rds",
+                                           group_fit_path = forward_validation_default_paths(fit_mode)$group_fit_path,
                                            output_path,
-                                           summary_output_path = forward_validation_summary_path(output_path),
+                                           summary_output_path = forward_validation_summary_path(output_path, fit_mode),
                                            bottleneck_size = 1000L,
                                            expansion_factor = 32L,
                                            n_reps = 30L,
@@ -229,7 +278,13 @@ load_forward_validation_result <- function(forward_group_id,
                                            distance_metric = c("chrom_weighted_wasserstein", "wasserstein"),
                                            checkpoint_dir = NULL,
                                            checkpoint_batch_size = n_cores,
-                                           update_aggregate = missing(summary_output_path)) {
+                                           update_aggregate = missing(summary_output_path),
+                                           fit_mode = c("pooled_group_v1", "interval_shared_wgd_v1")) {
+  fit_mode <- match.arg(fit_mode)
+  if (fit_mode == "interval_shared_wgd_v1") {
+    if (missing(update_aggregate)) update_aggregate <- FALSE
+    if (missing(output_path)) output_path <- forward_validation_default_paths(fit_mode)$output_path
+  }
   if (missing(forward_group_id) || !nzchar(forward_group_id)) {
     stop("load_forward_validation_result() requires a non-empty `forward_group_id`.")
   }
@@ -240,9 +295,12 @@ load_forward_validation_result <- function(forward_group_id,
 
   # The legacy monolith cache only checks the distance metric. Opt-in checkpoint
   # runs instead validate every simulation identity and rerun the cheap reporter.
-  needs_refresh <- !file.exists(output_path) || !is.null(checkpoint_dir)
+  needs_refresh <- !file.exists(output_path) || !is.null(checkpoint_dir) || fit_mode == "interval_shared_wgd_v1"
   if (!needs_refresh) {
     cached_result <- readRDS(output_path)
+    if (!is.null(cached_result$settings$fit_mode) && !identical(cached_result$settings$fit_mode, fit_mode)) {
+      stop("Cached forward result belongs to a different fit mode.")
+    }
     cached_metric <- if (!is.null(cached_result$settings$distance_metric)) {
       cached_result$settings$distance_metric
     } else {
@@ -268,7 +326,7 @@ load_forward_validation_result <- function(forward_group_id,
       distance_metric = distance_metric,
       checkpoint_dir = checkpoint_dir,
       checkpoint_batch_size = checkpoint_batch_size,
-      update_aggregate = update_aggregate
+      update_aggregate = update_aggregate, fit_mode = fit_mode
     )
   }
 
@@ -278,9 +336,10 @@ load_forward_validation_result <- function(forward_group_id,
 if (sys.nframe() == 0L) {
   option_list <- list(
     optparse::make_option("--grouped_intervals_path", type = "character", default = "core_data/grouped_intervals.Rds"),
-    optparse::make_option("--group_fit_path", type = "character", default = "results/group_fit_df.Rds"),
+    optparse::make_option("--group_fit_path", type = "character", default = NULL),
+    optparse::make_option("--fit_mode", type = "character", default = "pooled_group_v1"),
     optparse::make_option("--forward_group_id", type = "character", default = NULL),
-    optparse::make_option("--output_path", type = "character", default = "results/forward_validation.Rds"),
+    optparse::make_option("--output_path", type = "character", default = NULL),
     optparse::make_option("--summary_output_path", type = "character", default = NULL),
     optparse::make_option("--checkpoint_dir", type = "character", default = NULL),
     optparse::make_option("--checkpoint_batch_size", type = "integer", default = NULL),
@@ -299,6 +358,9 @@ if (sys.nframe() == 0L) {
     )
   )
   opt <- optparse::parse_args(optparse::OptionParser(option_list = option_list))
+  default_paths <- forward_validation_default_paths(opt$fit_mode)
+  if (is.null(opt$group_fit_path)) opt$group_fit_path <- default_paths$group_fit_path
+  if (is.null(opt$output_path)) opt$output_path <- default_paths$output_path
 
   if (is.null(opt$forward_group_id) || !nzchar(opt$forward_group_id)) {
     stop("scripts/run_forward_validation.R requires --forward_group_id=<group id>.")
@@ -307,7 +369,7 @@ if (sys.nframe() == 0L) {
   summary_output_path <- opt$summary_output_path
   update_aggregate <- is.null(summary_output_path) || !nzchar(summary_output_path)
   if (is.null(summary_output_path) || !nzchar(summary_output_path)) {
-    summary_output_path <- forward_validation_summary_path(opt$output_path)
+    summary_output_path <- forward_validation_summary_path(opt$output_path, opt$fit_mode)
   }
 
   run_forward_validation_main(
@@ -326,6 +388,6 @@ if (sys.nframe() == 0L) {
     distance_metric = opt$distance_metric,
     checkpoint_dir = opt$checkpoint_dir,
     checkpoint_batch_size = if (is.null(opt$checkpoint_batch_size)) opt$n_cores else opt$checkpoint_batch_size,
-    update_aggregate = update_aggregate
+    update_aggregate = update_aggregate && identical(opt$fit_mode, "pooled_group_v1"), fit_mode = opt$fit_mode
   )
 }

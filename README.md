@@ -1,6 +1,75 @@
 # Neutral Karyotype Evolution Simulator
 
-This repository contains the current analysis pipeline for fitting and checking a neutral model of karyotype evolution under chromosome mis-segregation and whole-genome doubling. The main goal is to estimate grouped `p_mis` and `p_wgd` values from observed endpoint karyotypes, then compare those fitted parameters to forward simulations.
+This repository contains the analysis pipeline for fitting and checking a neutral model of karyotype evolution under chromosome mis-segregation and whole-genome doubling. The default mode estimates grouped `p_mis` and `p_wgd` values. The explicit interval mode estimates a separate `p_mis` for each physical comparison while re-estimating a shared group-level `p_wgd`.
+
+## Interval fitting and checkpointed diagnostics
+
+Use `--fit_mode=interval_shared_wgd_v1` to opt into interval fitting. Existing
+commands retain their `pooled_group_v1` behavior. Both modes reuse the existing
+Markov likelihood and simulator. Interval mode evaluates each interval's grid,
+then chooses shared WGD by minimizing the sum of conditional interval minima.
+It preserves the supplied interval roster, division exposures and model grid.
+
+```bash
+Rscript scripts/fit_group_markov.R \
+  --fit_mode=interval_shared_wgd_v1 \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --output_path=results/interval_fit_grid.Rds \
+  --selected_output_path=results/interval_fits.Rds \
+  --checkpoint_dir=results/interval_fit_checkpoints
+```
+
+The selected table records physical-comparison identity, separate fit identity,
+shared-WGD profile identity, input hashes, support, boundary/tie flags and
+estimability. Exact ties use the lowest WGD followed by lowest CIN grid value;
+their support flags remain visible. Full likelihood surfaces are saved.
+Intervals without a finite shared profile remain explicit unavailable rows.
+Neither a unique optimum nor simulated endpoint spread establishes parameter
+uncertainty.
+
+For a deliberately small diagnostic smoke run:
+
+```bash
+Rscript scripts/run_forward_validation_all.R \
+  --fit_mode=interval_shared_wgd_v1 \
+  --grouped_intervals_path=core_data/grouped_intervals.Rds \
+  --group_fit_path=results/interval_fit_grid.Rds \
+  --output_dir=results/interval_forward_validation \
+  --summary_output_dir=result_summaries/interval_forward_validation \
+  --aggregate_output_path=data/neutral_interval_diagnostics.csv \
+  --checkpoint_dir=results/interval_forward_checkpoints \
+  --distance_metric=wasserstein \
+  --n_reps=3 --n_null_pairs=10 --n_cores=1 \
+  --bottleneck_size=200 --expansion_factor=8
+```
+
+These reduced settings are for smoke testing, not scientific defaults. Interval
+mode uses distinct default fit/result/summary/aggregate paths; explicit paths
+are honored. Its forward runner selects each interval's own parameter pair,
+including controls and any full-window comparisons supplied in the input.
+
+Rerun with the same checkpoint directory to resume. Completed grids, shared-WGD
+reductions, individual simulations and endpoint diagnostics are independently
+validated and reused. Seeds depend on physical interval, stage, replicate and
+master seed, so roster reordering or adding unrelated intervals does not shift
+existing random streams. Kernel, input, parameter and runtime changes invalidate
+the affected content. A neighbor's profile metadata change alone does not
+discard a valid simulation whose actual inputs and parameters are unchanged.
+Checkpoints use atomic writes, integrity hashes and lossless XZ compression.
+
+**Interval checks are descriptive pending refit calibration.** New summaries
+publish `diagnostic_p`, `calibration_status=pending_refit_calibration` and
+`inference_eligible=FALSE`; inferential `p_value`, `q_value` and rejection fields
+remain unavailable. They must not be promoted into calibrated neutrality claims.
+The existing conditional simulator does not define a joint shared-sample null
+for overlapping windows and shared-WGD refits. Resolving that scientific
+specification is separate from implementing interval fitting.
+
+Focused tests are `tests/test_interval_fitting.R` and
+`tests/test_interval_forward_checkpoints.R`; `tests/test_forward_checkpoints.R`
+checks historical checkpoint compatibility. They include numerical reference
+solutions, identity/invalidation checks and interruption/resume checks; the
+forward suite also uses tiny actual-simulator serial/parallel comparisons.
 
 ## Project overview
 
